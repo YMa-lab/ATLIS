@@ -7,7 +7,7 @@ Installation
 ------------
 You can install the released version of ATLIS from Github with the following code:
 
-`git clone https://github.com/WenjunZHAOwO/ATLIS.git`
+`git clone https://github.com/YMa-lab/ATLIS.git`
 
 Example usage
 ------------
