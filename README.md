@@ -26,7 +26,7 @@ Data download instructions can be found within each real data notebook.
 
 How to cite`ATLIS`
 -------------------
-Wenjun Zhao# and Ying Ma#, ATLIS: Anchored Tissue Landscapes in an Interpretable Latent Space. 2026
+Wenjun Zhao# and Ying Ma#, Cell-type-anchored latent modeling reconstructs spatial-temporal tissue dynamics. 2026
 
 
 
