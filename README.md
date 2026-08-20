@@ -9,13 +9,17 @@ You can install the released version of ATLIS from Github with the following cod
 
 `git clone https://github.com/YMa-lab/ATLIS.git`
 
-Example usage
+Example notebooks
 ------------
 [Synthetic example notebook](https://github.com/WenjunZHAOwO/ATLIS/blob/main/Scripts/Synthetic.ipynb)
 
 [Mouse dorsal brain example notebook](https://github.com/WenjunZHAOwO/ATLIS/blob/main/Scripts/Mouse_dorsal_brain.ipynb)
 
-[Zebrafish development example notebook](https://github.com/WenjunZHAOwO/ATLIS/blob/main/Scripts/Zesta.ipynb)
+[Zebrafish development example notebook](https://github.com/WenjunZHAOwO/ATLIS/blob/main/Scripts/Zesta_development.ipynb)
+
+[Axolotl brain regeneration example notebook](https://github.com/WenjunZHAOwO/ATLIS/blob/main/Scripts/Axolotl_regeneration.ipynb)
+
+[Mouse aging brain example notebook](https://github.com/WenjunZHAOwO/ATLIS/blob/main/Scripts/Mouse_aging.ipynb)
 
 Data download instructions can be found within each real data notebook.
 
