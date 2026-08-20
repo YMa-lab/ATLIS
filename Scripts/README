@@ -1,1 +1,3 @@
+This folder hosts Jupyter notebooks for each example in the manuscript across simulations and 4 real datasets. 
 
+The detailed data preprocessing procedures, as well as simulation model and parameters, can be found under the Data/ folder.
