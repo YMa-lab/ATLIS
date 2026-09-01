@@ -1,3 +1,0 @@
-This folder hosts necessary functions for ATLIS main functions, imputation, downstream tasks, and plotting functions. 
-
-In particular, we offer 4 options of ATLIS, with/without single cell reference, with/without GPU support. The functions can be inferred from the file names.

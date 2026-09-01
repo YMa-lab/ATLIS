@@ -100,6 +100,17 @@ def prepare_reference(data_dir, threshold=1.25):
     adata.obs["y"] = adata.obsm["spatial"][:, 1]
 
     adata.obs = adata.obs.rename(columns={"Annotation": "cellType"})
+
+
+    # MIN_CELLS = 20
+    # counts_per_type = adata.obs["cellType"].value_counts()
+    # keep = counts_per_type[counts_per_type >= MIN_CELLS].index
+    # dropped = sorted(set(counts_per_type.index) - set(keep))
+    # print(f"dropping {len(dropped)} cell types with <{MIN_CELLS} cells: {dropped}")
+
+    # adata = adata[adata.obs["cellType"].isin(keep)].copy()
+    # adata.obs["cellType"] = adata.obs["cellType"].astype(str).astype("category")
+
     
     return adata
 
@@ -191,7 +202,7 @@ def prepare_data(data_dir=None, threshold=1.25, return_sc=False):
     dpi30 = dpi30[dpi30.obs["inj_uninj"] == "inj"]
     dpi30 = dpi30[dpi30.obs["D_V"] == "D"]
 
-    adata = sc.concat((dpi2_rep1, dpi5_rep1, dpi10_rep1, dpi15_rep3, dpi20_rep2, dpi30))
+    adata = sc.concat((dpi2_rep1, dpi5_rep1, dpi10_rep1, dpi15_rep3, dpi20_rep2))#, dpi30))
     adata.obs_names_make_unique()
 
     sc.pp.normalize_total(adata, target_sum=1e4)
@@ -216,7 +227,7 @@ def prepare_data(data_dir=None, threshold=1.25, return_sc=False):
         adata_temp.obs["y"] = adata_temp.obsm["spatial"][:, 1]
         adata_all.append(adata_temp)
 
-    adata_sc = prepare_reference(data_dir = data_dir, threshold=threshold)
+    adata_sc = prepare_reference(data_dir = data_dir)
     
 
     B = find_B_music(adata_sc)
@@ -227,6 +238,8 @@ def prepare_data(data_dir=None, threshold=1.25, return_sc=False):
     counts, cell_types = from_anndata(adata_sc, celltype_key="cellType")
     genes_subset = select_informative_genes(pd_B, counts, cell_types, fc_thresh_ln=threshold)
     pd_B = pd_B.loc[:, genes_subset]
+    # pd_B = pd_B.div(pd_B.sum(axis=1), axis=0) * 1e4          # <-- add
+
     if return_sc == False:
         return adata_all, pd_B
     else:

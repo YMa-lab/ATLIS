@@ -24,135 +24,40 @@ Pipeline
 Returns counts, ground-truth V per slice, and ground-truth cluster
 labels per slice.
 """
-
 import numpy as np
 import pandas as pd
 import anndata as ad
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Geometry helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# def _sine_warp(coords, ax=0.03, ay=0.03, f=3.0, psi_x=0.0, psi_y=0.0):
+#     x, y = coords[0].copy(), coords[1].copy()
+#     Lx = x.max() - x.min(); Ly = y.max() - y.min()
+#     xw = x + ax * Lx * np.sin(2*np.pi*f*(y/Ly) + psi_y)
+#     yw = y + ay * Ly * np.sin(2*np.pi*f*(x/Lx) + psi_x)
+#     def _rescale(w, orig):
+#         rng = w.max() - w.min()
+#         if rng > 0:
+#             w = (w - w.min())/rng*(orig.max()-orig.min()) + orig.min()
+#         return w
+#     return np.vstack([_rescale(xw, x), _rescale(yw, y)])
 
 def _sine_warp(coords, ax=0.03, ay=0.03, f=3.0, psi_x=0.0, psi_y=0.0):
-    """
-    Smooth nonlinear sine-warp:
-        x' = x + ax*Lx*sin(2π f · y/Ly + ψ_y)
-        y' = y + ay*Ly*sin(2π f · x/Lx + ψ_x)
-    Spans are rescaled back to original after warping.
-    """
     x, y = coords[0].copy(), coords[1].copy()
-    Lx = x.max() - x.min()
-    Ly = y.max() - y.min()
-
-    xw = x + ax * Lx * np.sin(2 * np.pi * f * (y / Ly) + psi_y)
-    yw = y + ay * Ly * np.sin(2 * np.pi * f * (x / Lx) + psi_x)
-
-    def _rescale(w, orig):
-        rng = w.max() - w.min()
-        if rng > 0:
-            w = (w - w.min()) / rng * (orig.max() - orig.min()) + orig.min()
-        return w
-
-    return np.vstack([_rescale(xw, x), _rescale(yw, y)])
-
+    Lx = x.max() - x.min(); Ly = y.max() - y.min()
+    xw = x + ax * Lx * np.sin(2*np.pi*f*(y/Ly) + psi_y)
+    yw = y + ay * Ly * np.sin(2*np.pi*f*(x/Lx) + psi_x)
+    return np.vstack([xw, yw])
 
 def _build_neighbor_graph(coords, n_neighbors=6):
-    """k-NN spatial graph from (2, n_spots) coords."""
     from scipy.spatial import cKDTree
     tree = cKDTree(coords.T)
-    _, idxs = tree.query(coords.T, k=n_neighbors + 1)
+    _, idxs = tree.query(coords.T, k=n_neighbors+1)
     return [row[1:] for row in idxs]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Clustering on V
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _leiden_cluster_V(V, n_clusters=4, seed=0, n_neighbors=15):
-    """
-    Cluster spots by their V row using Leiden, tuning resolution to hit
-    the target n_clusters via binary search.
-    """
-    import scanpy as sc
-
-    tmp = ad.AnnData(V.astype(np.float32))
-    sc.pp.neighbors(tmp, n_neighbors=n_neighbors,
-                    use_rep='X', random_state=seed)
-
-    lo, hi = 0.05, 5.0
-    best_labels = None
-    best_k = -1
-    for _ in range(25):
-        mid = (lo + hi) / 2.0
-        sc.tl.leiden(tmp, resolution=mid, random_state=seed,
-                     key_added='leiden', flavor='igraph',
-                     directed=False, n_iterations=2)
-        labels = tmp.obs['leiden'].astype(int).values
-        k = labels.max() + 1
-        if k == n_clusters:
-            best_labels = labels
-            best_k = k
-            break
-        if best_labels is None or abs(k - n_clusters) < abs(best_k - n_clusters):
-            best_labels = labels
-            best_k = k
-        if k < n_clusters:
-            lo = mid
-        else:
-            hi = mid
-
-    if best_k != n_clusters:
-        print(f"  Warning: Leiden produced {best_k} clusters, "
-              f"target was {n_clusters}. Using {best_k}.")
-
-    return best_labels.astype(int)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Assigning a dominant cell type to each cluster
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _assign_cluster_dominants(
-    V_card, cluster_labels, type_names,
-    cluster_dominants=None,
-    dom_override=None, sec_override=None,
-):
-    """
-    Decide a unique dominant cell type for each cluster, plus a
-    (non-unique) second-dominant.
-
-    Modes
-    -----
-    dom_override is a dict {cluster_id -> type index}
-        Use it verbatim. Overrides every abundance-based rule below.
-        This exists because `avg_V` is recomputed from whatever
-        `cluster_labels` it is handed, so as cancer invasion changes
-        cluster membership the abundance ranking drifts and both other
-        modes can silently reassign dominants between time points.
-
-    cluster_dominants is None (default — auto with uniqueness)
-        Process clusters in descending order of how "peaked" their V
-        argmax is. For each cluster, walk its V-rank order and pick
-        the first cell type not yet taken by an earlier cluster.
-
-    cluster_dominants is a list of cell-type names
-        Greedy assignment. For each name in the list, find the
-        unassigned cluster where that cell type has the highest mean V,
-        assign it there. Any clusters left over (if the list is shorter
-        than n_clusters) fall back to the auto rule.
-
-    Returns
-    -------
-    dom_for_cluster, sec_for_cluster : dict {cluster_id (int) -> idx (int)}
-    """
+def _assign_cluster_dominants(V_card, cluster_labels, type_names,
+                              cluster_dominants=None, dom_override=None, sec_override=None):
     K = V_card.shape[1]
     unique_clusters = sorted(int(c) for c in np.unique(cluster_labels))
-
-    avg_V = {c: V_card[cluster_labels == c].mean(axis=0)
-             for c in unique_clusters}
-
-    # ── Explicit cluster→type map wins over any abundance-based rule. ──
+    avg_V = {c: V_card[cluster_labels == c].mean(axis=0) for c in unique_clusters}
     if dom_override is not None:
         dom_for_cluster = {c: int(dom_override[c]) for c in unique_clusters}
         if sec_override is not None:
@@ -160,457 +65,343 @@ def _assign_cluster_dominants(
         else:
             sec_for_cluster = {}
             for c in unique_clusters:
-                order = np.argsort(avg_V[c])[::-1]
-                dom = dom_for_cluster[c]
-                sec_for_cluster[c] = next(
-                    (int(i) for i in order if int(i) != dom), dom
-                )
+                order = np.argsort(avg_V[c])[::-1]; dom = dom_for_cluster[c]
+                sec_for_cluster[c] = next((int(i) for i in order if int(i) != dom), dom)
         return dom_for_cluster, sec_for_cluster
-
-    dom_for_cluster = {}
-    taken = set()
-
+    dom_for_cluster = {}; taken = set()
     if cluster_dominants is not None:
         name_to_idx = {n: i for i, n in enumerate(type_names)}
         missing = [n for n in cluster_dominants if n not in name_to_idx]
-        if missing:
-            raise ValueError(
-                f"cluster_dominants contains unknown cell types: {missing}. "
-                f"Valid options: {list(type_names)}"
-            )
+        if missing: raise ValueError(f"unknown cell types: {missing}")
         if len(set(cluster_dominants)) != len(cluster_dominants):
-            raise ValueError(
-                f"cluster_dominants contains duplicates: {cluster_dominants}"
-            )
-
+            raise ValueError("duplicates")
         unassigned = set(unique_clusters)
         for name in cluster_dominants:
-            if not unassigned:
-                print(f"  Warning: more cluster_dominants than clusters; "
-                      f"ignoring trailing entries starting at '{name}'.")
-                break
+            if not unassigned: break
             idx = name_to_idx[name]
             best_c = max(unassigned, key=lambda c: avg_V[c][idx])
-            dom_for_cluster[best_c] = idx
-            taken.add(idx)
-            unassigned.remove(best_c)
-
+            dom_for_cluster[best_c] = idx; taken.add(idx); unassigned.remove(best_c)
         remaining = sorted(unassigned)
     else:
         remaining = list(unique_clusters)
-
-    # Auto rule for clusters still without an assigned dominant.
     if remaining:
-        # Peakiness = gap between #1 and #2 in cluster-average V.
         if K >= 2:
-            peakiness = {c: avg_V[c].max() - np.partition(avg_V[c], -2)[-2]
-                         for c in remaining}
+            peakiness = {c: avg_V[c].max()-np.partition(avg_V[c],-2)[-2] for c in remaining}
         else:
             peakiness = {c: 0.0 for c in remaining}
-        # Process most-peaked first so they get first pick.
         remaining = sorted(remaining, key=lambda c: -peakiness[c])
-
         for c in remaining:
-            order = np.argsort(avg_V[c])[::-1]
-            chosen = None
+            order = np.argsort(avg_V[c])[::-1]; chosen = None
             for idx in order:
-                if int(idx) not in taken:
-                    chosen = int(idx)
-                    break
-            if chosen is None:
-                # More clusters than cell types — shouldn't normally happen,
-                # but fall back to the cluster's natural argmax (allowing
-                # duplicate) so we never crash.
-                chosen = int(order[0])
-                print(f"  Warning: cluster {c} forced to share dominant "
-                      f"({type_names[chosen]}) — more clusters than cell types.")
-            dom_for_cluster[c] = chosen
-            taken.add(chosen)
-
-    # Second-dominant = highest V cell type that isn't this cluster's dominant.
-    # Second identities are NOT forced unique across clusters.
+                if int(idx) not in taken: chosen = int(idx); break
+            if chosen is None: chosen = int(order[0])
+            dom_for_cluster[c] = chosen; taken.add(chosen)
     sec_for_cluster = {}
     for c in unique_clusters:
-        order = np.argsort(avg_V[c])[::-1]
-        dom = dom_for_cluster[c]
-        sec = None
+        order = np.argsort(avg_V[c])[::-1]; dom = dom_for_cluster[c]; sec = None
         for idx in order:
-            if int(idx) != dom:
-                sec = int(idx)
-                break
+            if int(idx) != dom: sec = int(idx); break
         sec_for_cluster[c] = sec if sec is not None else dom
-
     return dom_for_cluster, sec_for_cluster
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# V reconstruction
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _reconstruct_V_from_clusters(
-    V_card, cluster_labels, type_names,
-    dom_frac=0.5, sec_frac=0.2, noise_frac=0.3,
-    dirichlet_alpha=1.0, cluster_dominants=None, rng=None,
-    dom_override=None, sec_override=None,
-):
-    """
-    Build a structured V from cluster labels.
-
-    For each cluster:
-      - dom_frac mass on its (unique) dominant cell type
-      - sec_frac mass on its second-dominant
-      - noise_frac mass spread across all OTHER types via Dirichlet
-
-    dom_override / sec_override : dict {cluster_id -> type index} or None
-        Pin the cluster→type assignment instead of re-deriving it from
-        cluster-average abundance. Pass the t=0 map here for t>0 slices.
-
-    Returns
-    -------
-    V_new        : (n_spots, K) array, rows sum to 1
-    cluster_info : dict {cluster_id -> {'dominant', 'second', 'n_spots'}}
-    """
-    if rng is None:
-        rng = np.random.default_rng(0)
-
-    total = dom_frac + sec_frac + noise_frac
-    if not np.isclose(total, 1.0):
-        raise ValueError(
-            f"dom_frac + sec_frac + noise_frac must sum to 1, got {total:.3f}"
-        )
-
+def _reconstruct_V_from_clusters(V_card, cluster_labels, type_names,
+        dom_frac=0.5, sec_frac=0.2, noise_frac=0.3, dirichlet_alpha=1.0,
+        cluster_dominants=None, rng=None, dom_override=None, sec_override=None):
+    if rng is None: rng = np.random.default_rng(0)
+    total = dom_frac+sec_frac+noise_frac
+    if not np.isclose(total,1.0): raise ValueError(f"must sum to 1, got {total:.3f}")
     n_spots, K = V_card.shape
-    V_new = np.zeros_like(V_card, dtype=np.float32)
-    cluster_info = {}
-
+    V_new = np.zeros_like(V_card, dtype=np.float32); cluster_info = {}
     dom_for_cluster, sec_for_cluster = _assign_cluster_dominants(
-        V_card, cluster_labels, type_names,
-        cluster_dominants=cluster_dominants,
-        dom_override=dom_override, sec_override=sec_override,
-    )
-
+        V_card, cluster_labels, type_names, cluster_dominants=cluster_dominants,
+        dom_override=dom_override, sec_override=sec_override)
     for c in sorted(dom_for_cluster.keys()):
         mask = cluster_labels == c
-        dom_idx = dom_for_cluster[c]
-        sec_idx = sec_for_cluster[c]
-        cluster_info[int(c)] = {
-            'dominant': dom_idx,
-            'second':   sec_idx,
-            'n_spots':  int(mask.sum()),
-        }
-
-        other_idx = np.array([i for i in range(K)
-                              if i != dom_idx and i != sec_idx])
-
+        dom_idx = dom_for_cluster[c]; sec_idx = sec_for_cluster[c]
+        cluster_info[int(c)] = {'dominant':dom_idx,'second':sec_idx,'n_spots':int(mask.sum())}
+        other_idx = np.array([i for i in range(K) if i != dom_idx and i != sec_idx])
         n_in = mask.sum()
         if other_idx.size > 0:
-            alpha_vec   = np.full(other_idx.size, dirichlet_alpha)
-            noise_props = rng.dirichlet(alpha_vec, size=n_in)
+            noise_props = rng.dirichlet(np.full(other_idx.size, dirichlet_alpha), size=n_in)
         else:
-            noise_props = np.zeros((n_in, 0))
-
-        cluster_V = np.zeros((n_in, K), dtype=np.float32)
+            noise_props = np.zeros((n_in,0))
+        cluster_V = np.zeros((n_in,K), dtype=np.float32)
         cluster_V[:, dom_idx] += dom_frac
-        if sec_idx != dom_idx:
-            cluster_V[:, sec_idx] += sec_frac
-        else:
-            cluster_V[:, dom_idx] += sec_frac
-        if other_idx.size > 0:
-            cluster_V[:, other_idx] += noise_frac * noise_props
-
+        if sec_idx != dom_idx: cluster_V[:, sec_idx] += sec_frac
+        else: cluster_V[:, dom_idx] += sec_frac
+        if other_idx.size > 0: cluster_V[:, other_idx] += noise_frac*noise_props
         V_new[mask] = cluster_V
-
-    V_new = V_new / V_new.sum(axis=1, keepdims=True)
+    V_new = V_new/V_new.sum(axis=1, keepdims=True)
     return V_new, cluster_info
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Cluster-label propagation (cancer invasion)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _propagate_cancer_labels(
-    cluster_labels, cancer_cluster_ids, neighbors,
-    invasion_prob=0.3, rng=None,
-):
-    """
-    One step of label propagation: every non-cancer spot adjacent to ≥1
-    cancer-cluster neighbor converts with probability `invasion_prob`.
-    If multiple cancer clusters are adjacent, the invading cluster is
-    drawn proportionally to neighbor count.
-    """
-    if rng is None:
-        rng = np.random.default_rng(0)
+def _propagate_cancer_labels(cluster_labels, cancer_cluster_ids, neighbors,
+                             invasion_prob=0.3, rng=None):
+    if rng is None: rng = np.random.default_rng(0)
     cancer_set = set(int(c) for c in cancer_cluster_ids)
     new_labels = cluster_labels.copy()
     is_cancer = np.array([lab in cancer_set for lab in cluster_labels])
-
     for i in range(len(cluster_labels)):
-        if is_cancer[i]:
-            continue
+        if is_cancer[i]: continue
         nbr_labels = cluster_labels[neighbors[i]]
         cancer_nbrs = [int(l) for l in nbr_labels if int(l) in cancer_set]
-        if not cancer_nbrs:
-            continue
+        if not cancer_nbrs: continue
         if rng.random() < invasion_prob:
             uniq, counts = np.unique(cancer_nbrs, return_counts=True)
-            probs = counts / counts.sum()
-            new_labels[i] = rng.choice(uniq, p=probs)
-
+            new_labels[i] = rng.choice(uniq, p=counts/counts.sum())
     return new_labels
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Count generation
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _calibrate_lib_mean(V, B_matrix, target_sparsity, negbinom_r, lib_sigma, rng,
                         lo=0.5, hi=8.0, n_iter=20, n_sample=500):
     idx = rng.choice(V.shape[0], size=min(n_sample, V.shape[0]), replace=False)
-    V_sub = V[idx]
-    mean_expr = V_sub @ B_matrix
-
+    mean_expr = V[idx] @ B_matrix
     for _ in range(n_iter):
-        mid = (lo + hi) / 2.0
-        lib = np.exp(mid + 0.5 * lib_sigma**2)
-        lam = mean_expr * lib
-        p   = negbinom_r / (negbinom_r + np.clip(lam, 1e-8, None))
-        prob_zero = np.mean(p ** negbinom_r)
-        if prob_zero < target_sparsity:
-            hi = mid
-        else:
-            lo = mid
-    return (lo + hi) / 2.0
+        mid = (lo+hi)/2.0
+        lib = np.exp(mid+0.5*lib_sigma**2)
+        lam = mean_expr*lib
+        p = negbinom_r/(negbinom_r+np.clip(lam,1e-8,None))
+        if np.mean(p**negbinom_r) < target_sparsity: hi = mid
+        else: lo = mid
+    return (lo+hi)/2.0
 
-
-def _generate_counts(V, B_matrix, rng, negbinom_r=5.0,
-                     lib_mean=8.0, lib_sigma=0.5):
+def _generate_counts(V, B_matrix, rng, negbinom_r=5.0, lib_mean=8.0, lib_sigma=0.5):
     n_spots = V.shape[0]
-    mean_expr    = V @ B_matrix
-    library_size = rng.lognormal(lib_mean, lib_sigma, size=(n_spots, 1))
-    lam          = mean_expr * library_size
-
-    p          = negbinom_r / (negbinom_r + np.clip(lam, 1e-8, None))
+    mean_expr = V @ B_matrix
+    library_size = rng.lognormal(lib_mean, lib_sigma, size=(n_spots,1))
+    lam = mean_expr*library_size
+    p = negbinom_r/(negbinom_r+np.clip(lam,1e-8,None))
     raw_counts = rng.negative_binomial(negbinom_r, p).astype(np.float32)
-
-    totals     = raw_counts.sum(axis=1, keepdims=True)
-    totals     = np.where(totals == 0, 1.0, totals)
-    normalised = raw_counts / totals * 1e4
-    return normalised, raw_counts
+    totals = raw_counts.sum(axis=1, keepdims=True)
+    totals = np.where(totals==0, 1.0, totals)
+    return raw_counts/totals*1e4, raw_counts
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────────────────────────────────
+def load_region_annotation(path, strip_x=True):
+    """clusters.csv -> pd.Series of region name indexed by spot barcode."""
+    ann = pd.read_csv(path, index_col=0).iloc[:, 0]
+    if strip_x:
+        ann.index = ann.index.str.lstrip('X')
+    return ann.str.strip().str.lower()
+
 
 def create_realistic_data(
     ref_adata,
     pd_B,
     V_card,
-    n_time         = 5,
-    # ── Clustering ──────────────────────────────────────────────────────
-    n_clusters     = 4,
-    leiden_neighbors = 15,
-    # ── V reconstruction (fractions must sum to 1) ──────────────────────
-    dom_frac       = 0.5,
-    sec_frac       = 0.2,
-    noise_frac     = 0.3,
-    dirichlet_alpha = 1.0,
-    cluster_dominants = None,     # list[str] of cell-type names (optional)
-    # ── Cancer invasion ────────────────────────────────────────────────
-    cancer_types   = None,        # cell-type names; clusters dominated by
-                                  # any of these are treated as cancer
-    invasion_prob  = 0.3,
-    n_neighbors    = 6,
-    # ── Geometry ───────────────────────────────────────────────────────
-    warp_amplitude = 0.03,
-    warp_freq      = 3.0,
-    extra_scale    = 1.1,
-    extra_rotate_deg = 25.0,
-    # ── Count model ────────────────────────────────────────────────────
-    negbinom_r     = 5.0,
-    lib_mean       = 8.0,
-    lib_sigma      = 0.5,
-    seed           = 0,
+    region_annotation,            # path to clusters.csv, or a pd.Series
+    n_time            = 5,
+    # ── Domains ─────────────────────────────────────────────────────────
+    region_order      = ('cancer', 'pancreatic', 'duct epthelium', 'stroma'),
+    cancer_regions    = ('cancer',),
+    region_dominants  = None,      # {region name -> cell type name}
+    region_seconds    = None,      # {region name -> cell type name}, optional
+    # ── V reconstruction ────────────────────────────────────────────────
+    dom_frac          = 0.5,
+    sec_frac          = 0.2,
+    noise_frac        = 0.3,
+    dirichlet_alpha   = 1.0,
+    # ── Cancer invasion ─────────────────────────────────────────────────
+    invasion_prob     = 0.3,
+    n_neighbors       = 6,
+    # ── Geometry ────────────────────────────────────────────────────────
+    warp_amplitude    = 0.03,
+    warp_freq         = 3.0,
+    extra_scale       = 1.1,
+    extra_rotate_deg  = 25.0,
+    # ── Spot dropout ────────────────────────────────────────────────────
+    dropout_frac      = 0.0,       # 0 = disabled; e.g. 0.1 drops 10% per slice
+    # ── Count model ─────────────────────────────────────────────────────
+    negbinom_r        = 5.0,
+    lib_sigma         = 0.5,
+    seed              = 0,
 ):
     """
-    Build a cluster-anchored multi-slice synthetic dataset.
-
-    Parameters
-    ----------
-    ref_adata : AnnData
-        Real slice, preprocessed (normalize_total 1e4 + filter_genes).
-        Must have obs['x'], obs['y'].
-    pd_B : pd.DataFrame
-        Cell-type × gene matrix. Index = cell-type names matching V_card
-        columns. Columns = gene names intersected with ref_adata.var_names.
-    V_card : pd.DataFrame
-        CARD result, spots × cell types. Used to seed Leiden clustering
-        and to identify each cluster's dominant cell type.
-    n_time : int
-    n_clusters : int
-        Target Leiden cluster count.
-    leiden_neighbors : int
-    dom_frac, sec_frac, noise_frac : float
-        Must sum to 1. Default 0.5/0.2/0.3.
-    dirichlet_alpha : float
-        Concentration for the noise Dirichlet. <1 peakier, >1 flatter.
-    cluster_dominants : list[str] or None
-        Optional ordered list of cell-type names that will be each
-        cluster's dominant identity. Greedy match to clusters by V
-        abundance — list ORDER does not have to match Leiden cluster
-        IDs. If None, dominants are auto-picked from V_card with
-        uniqueness enforced (no two clusters share a dominant).
-        Either way the resulting map is resolved once at t=0 and then
-        held fixed for all later slices.
-    cancer_types : list[str] or None
-        Clusters dominated by any of these cell types are flagged as
-        cancer and propagate via invasion. None disables invasion.
-    invasion_prob : float
-        P(convert) per slice for non-cancer spots with ≥1 cancer neighbor.
-    n_neighbors : int
-        k for the spatial k-NN graph used for label propagation.
-    warp_amplitude, warp_freq, extra_scale, extra_rotate_deg :
-        Geometric distortion, accumulates with t.
-    negbinom_r, lib_sigma : NB model. lib_mean is auto-calibrated.
-    seed : int
-
     Returns
     -------
-    adata_list : list[AnnData]
-        .X = UMI-normalised, .layers['counts'] = raw NB ints,
-        .obs['x','y'] = warped coords, .obs['cluster'] = GT label,
-        .obsm['V_true'] = GT composition.
-    V_true_temporal : list[ndarray]
-    cluster_labels_temporal : list[ndarray]
-    ref_adata_out : AnnData (mean-centred, unwarped)
-    pd_B_out : pd.DataFrame
-    warp_params : list[dict]
+    adata_list, V_true_temporal, cluster_labels_temporal,
+    ref_adata_out, pd_B_out, warp_params, region_map
+
+    region_map : dict {cluster_id -> region name}
+
+    Notes
+    -----
+    Domains are the regions in clusters.csv. Each region's dominant cell type
+    is chosen from V_card abundance inside that region (or forced with
+    cluster_dominants). cancer_regions names which regions invade — it refers
+    to region names in the annotation, not to cell types.
     """
     rng = np.random.default_rng(seed)
 
-    # ── 1. Align spots ───────────────────────────────────────────────────
-    # shared_spots must be in ref_adata's own row order, and the subset must
-    # be unconditional. Index.intersection() may return sorted output, which
-    # would silently decouple V0 (shared_spots order) from ref_coords
-    # (ref_adata order) whenever no spots are dropped.
-    mask = ref_adata.obs_names.isin(V_card.index)
-    if not mask.any():
-        raise ValueError("ref_adata.obs_names and V_card.index share no spots.")
+    if isinstance(region_annotation, (str, bytes)):
+        ann = load_region_annotation(region_annotation)
+    else:
+        ann = region_annotation.copy()
+        ann.index = ann.index.astype(str).str.lstrip('X')
+        ann = ann.str.strip().str.lower()
 
+    # ── 1. Align spots: must be in ref_adata order, and in the annotation ─
+    mask = ref_adata.obs_names.isin(V_card.index) & ref_adata.obs_names.isin(ann.index)
+    if not mask.any():
+        raise ValueError("no spots shared between ref_adata, V_card and the annotation.")
     shared_spots = ref_adata.obs_names[mask]
     n_dropped = ref_adata.n_obs - len(shared_spots)
     if n_dropped:
-        print(f"  Warning: {n_dropped} spots in adata not in V_card — "
-              f"subsetting to {len(shared_spots)}.")
-
+        print(f"  Warning: dropping {n_dropped} spots -> {len(shared_spots)}.")
     ref_adata = ref_adata[shared_spots].copy()
-    assert (ref_adata.obs_names == shared_spots).all()
 
-    V0 = V_card.loc[shared_spots, :].values.astype(np.float32)
-    V0 /= V0.sum(axis=1, keepdims=True)
-
-    n_spots    = ref_adata.n_obs
-    type_names = list(V_card.columns)
+    # ── 2. Cell-type order comes from pd_B; V0 follows it ────────────────
+    type_names = list(pd_B.index)
     K          = len(type_names)
+    V0 = V_card.loc[shared_spots, type_names].values.astype(np.float32)
+    V0 /= V0.sum(axis=1, keepdims=True)
+    n_spots = ref_adata.n_obs
 
-    # ── 2. Align genes ───────────────────────────────────────────────────
     shared_genes = pd_B.columns.intersection(ref_adata.var_names)
     if len(shared_genes) == 0:
         raise ValueError("pd_B columns and ref_adata.var_names share no genes.")
-    pd_B      = pd_B[shared_genes].copy()
-    B_matrix  = pd_B.values.astype(np.float64)
+    pd_B       = pd_B[shared_genes].copy()
+    B_matrix   = pd_B.values.astype(np.float64)
     gene_names = list(shared_genes)
-    n_genes    = len(gene_names)
-    print(f"  Spots: {n_spots}  |  Cell types: {K}  |  Genes: {n_genes}")
+    print(f"  Spots: {n_spots}  |  Cell types: {K}  |  Genes: {len(gene_names)}")
 
-    # ── 3. Leiden cluster on V ───────────────────────────────────────────
-    print(f"  Clustering V into {n_clusters} regions via Leiden...")
-    base_cluster_labels = _leiden_cluster_V(
-        V0, n_clusters=n_clusters, seed=seed,
-        n_neighbors=leiden_neighbors,
-    )
+    # ── 3. Domains from the annotation ───────────────────────────────────
+    region_order = list(region_order)
+    unknown = set(ann.reindex(shared_spots)) - set(region_order)
+    if unknown:
+        raise ValueError(f"regions in annotation not listed in region_order: {unknown}")
 
-    # ── 4. Reconstruct V (handles dominants assignment) ──────────────────
-    print(f"  Reconstructing V  (dom={dom_frac}, sec={sec_frac}, noise={noise_frac})")
-    if cluster_dominants is not None:
-        print(f"  Explicit dominants: {cluster_dominants}")
-    V_structured, cluster_info = _reconstruct_V_from_clusters(
-        V0, base_cluster_labels, type_names,
-        dom_frac=dom_frac, sec_frac=sec_frac, noise_frac=noise_frac,
-        dirichlet_alpha=dirichlet_alpha,
-        cluster_dominants=cluster_dominants,
-        rng=rng,
-    )
-    for c in sorted(cluster_info):
-        info = cluster_info[c]
-        print(f"    cluster {c}: dominant={type_names[info['dominant']]}, "
-              f"second={type_names[info['second']]}, n={info['n_spots']}")
+    region_to_id = {r: i for i, r in enumerate(region_order)}
+    base_cluster_labels = ann.reindex(shared_spots).map(region_to_id).values.astype(int)
+    region_map = {i: r for r, i in region_to_id.items()}
 
-    # Freeze the t=0 cluster→type map. Invasion changes cluster membership,
-    # which changes cluster-average abundance, which would otherwise let
-    # _assign_cluster_dominants hand a cluster a different dominant at t>0.
-    dom_map = {c: info['dominant'] for c, info in cluster_info.items()}
-    sec_map = {c: info['second']   for c, info in cluster_info.items()}
+    for c in sorted(region_map):
+        print(f"    cluster {c} = {region_map[c]:14s} n={(base_cluster_labels == c).sum()}")
 
-    # ── 5. Resolve cancer clusters ───────────────────────────────────────
-    cancer_cluster_ids = []
-    if cancer_types is not None:
-        missing = [t for t in cancer_types if t not in type_names]
+    # ── 4. Dominants: explicit per region, else abundance ────────────────
+    if region_dominants is not None:
+        bad = [r for r in region_dominants if r not in region_to_id]
+        if bad:
+            raise ValueError(f"region_dominants keys not in region_order: {bad}\n"
+                             f"  valid regions: {list(region_to_id)}")
+        bad = [t for t in region_dominants.values() if t not in type_names]
+        if bad:
+            raise ValueError(f"region_dominants values not in pd_B.index: {bad}")
+        missing = [r for r in region_to_id if r not in region_dominants]
         if missing:
-            raise ValueError(f"cancer_types not in V_card columns: {missing}")
-        cancer_type_idx = {type_names.index(t) for t in cancer_types}
-        for c, info in cluster_info.items():
-            if info['dominant'] in cancer_type_idx:
-                cancer_cluster_ids.append(c)
-        if not cancer_cluster_ids:
-            raise ValueError(
-                f"No cluster has any of {cancer_types} as dominant. "
-                f"Either pass cluster_dominants=[...] to force one, or "
-                f"increase n_clusters. "
-                f"Current dominants: "
-                f"{[type_names[cluster_info[c]['dominant']] for c in sorted(cluster_info)]}"
-            )
-        print(f"  Cancer clusters  : {cancer_cluster_ids}  "
-              f"(invasion_prob={invasion_prob})")
+            raise ValueError(f"region_dominants must name every region; "
+                             f"missing: {missing}")
+        dups = [t for t in set(region_dominants.values())
+                if list(region_dominants.values()).count(t) > 1]
+        if dups:
+            raise ValueError(f"region_dominants assigns the same type twice: {dups}")
+
+        dom_map = {region_to_id[r]: type_names.index(t)
+                   for r, t in region_dominants.items()}
+
+        if region_seconds is not None:
+            bad = [t for t in region_seconds.values() if t not in type_names]
+            if bad:
+                raise ValueError(f"region_seconds values not in pd_B.index: {bad}")
+            sec_map = {}
+            for c, r in region_map.items():
+                if r in region_seconds:
+                    s = type_names.index(region_seconds[r])
+                    if s == dom_map[c]:
+                        raise ValueError(
+                            f"region '{r}': second equals dominant "
+                            f"({region_seconds[r]})")
+                    sec_map[c] = s
+                else:
+                    sec_map[c] = next(
+                        int(i) for i in np.argsort(V0[base_cluster_labels == c].mean(0))[::-1]
+                        if int(i) != dom_map[c])
+        else:
+            sec_map = {c: next(
+                int(i) for i in np.argsort(V0[base_cluster_labels == c].mean(0))[::-1]
+                if int(i) != dom_map[c]) for c in region_map}
+
+        V_structured, cluster_info = _reconstruct_V_from_clusters(
+            V0, base_cluster_labels, type_names,
+            dom_frac=dom_frac, sec_frac=sec_frac, noise_frac=noise_frac,
+            dirichlet_alpha=dirichlet_alpha, rng=rng,
+            dom_override=dom_map, sec_override=sec_map,
+        )
+    else:
+        V_structured, cluster_info = _reconstruct_V_from_clusters(
+            V0, base_cluster_labels, type_names,
+            dom_frac=dom_frac, sec_frac=sec_frac, noise_frac=noise_frac,
+            dirichlet_alpha=dirichlet_alpha, rng=rng,
+        )
+        dom_map = {c: i['dominant'] for c, i in cluster_info.items()}
+        sec_map = {c: i['second']   for c, i in cluster_info.items()}
+
+    for c in sorted(cluster_info):
+        i = cluster_info[c]
+        print(f"    cluster {c} ({region_map[c]}): "
+              f"dominant={type_names[i['dominant']]}, "
+              f"second={type_names[i['second']]}")
+
+    # program similarity between the chosen dominants — high values mean
+    # those domains are not separable by any reference-based method
+    _d = [cluster_info[c]['dominant'] for c in sorted(cluster_info)]
+    _P = B_matrix[_d]
+    _P = _P / (np.linalg.norm(_P, axis=1, keepdims=True) + 1e-12)
+    _S = _P @ _P.T
+    _worst = max(((_S[a, b], a, b) for a in range(len(_d))
+                  for b in range(a + 1, len(_d))), default=(0, 0, 0))
+    print(f"  Max dominant-program cosine: {_worst[0]:.3f} "
+          f"({region_map[sorted(cluster_info)[_worst[1]]]} vs "
+          f"{region_map[sorted(cluster_info)[_worst[2]]]})")
+
+    # ── 5. Cancer clusters (by region name, not cell type) ───────────────
+    cancer_regions = list(cancer_regions) if cancer_regions else []
+    unknown = [r for r in cancer_regions if r not in region_to_id]
+    if unknown:
+        raise ValueError(f"cancer_regions not in region_order: {unknown}")
+    cancer_cluster_ids = [region_to_id[r] for r in cancer_regions]
+    if cancer_cluster_ids:
+        print(f"  Cancer regions   : {cancer_regions} -> clusters "
+              f"{cancer_cluster_ids}, p={invasion_prob}")
     else:
         print("  Cancer invasion  : disabled")
 
-    # ── 6. Coords + neighbor graph ───────────────────────────────────────
+    # ── 6. Coords + graph ────────────────────────────────────────────────
     ref_coords = np.vstack([ref_adata.obs['x'].values,
                             ref_adata.obs['y'].values]).astype(float)
     ref_coords -= ref_coords.mean(axis=1, keepdims=True)
     neighbors = _build_neighbor_graph(ref_coords, n_neighbors=n_neighbors)
 
-    # ── 7. Calibrate lib_mean ────────────────────────────────────────────
+    # ── 7. Calibrate ─────────────────────────────────────────────────────
     real_X = ref_adata[:, gene_names].X
     if hasattr(real_X, "toarray"):
         real_X = real_X.toarray()
     target_sparsity = float((np.asarray(real_X) == 0).mean())
-    print(f"  Target sparsity  : {target_sparsity:.3f}")
-
     lib_mean = _calibrate_lib_mean(
         V_structured, B_matrix, target_sparsity,
         negbinom_r=negbinom_r, lib_sigma=lib_sigma, rng=rng,
     )
-    print(f"  Calibrated lib_mean: {lib_mean:.3f}")
+    print(f"  Sparsity {target_sparsity:.3f} -> lib_mean {lib_mean:.3f}")
 
-    # ── 8. Evolve cluster labels ─────────────────────────────────────────
+    # ── 8. Evolve labels ─────────────────────────────────────────────────
     cluster_labels_temporal = [base_cluster_labels.copy()]
-    current_labels = base_cluster_labels.copy()
+    current = base_cluster_labels.copy()
     for t in range(1, n_time):
         if cancer_cluster_ids:
-            current_labels = _propagate_cancer_labels(
-                current_labels, cancer_cluster_ids, neighbors,
+            current = _propagate_cancer_labels(
+                current, cancer_cluster_ids, neighbors,
                 invasion_prob=invasion_prob, rng=rng,
             )
-        cluster_labels_temporal.append(current_labels.copy())
+        cluster_labels_temporal.append(current.copy())
 
-    # ── 9. Build slices ──────────────────────────────────────────────────
-    adata_list      = []
-    V_true_temporal = []
-    warp_params     = []
-    psi_x_fixed = rng.uniform(0, 2 * np.pi)
-    psi_y_fixed = rng.uniform(0, 2 * np.pi)
+    # ── 9. Slices ────────────────────────────────────────────────────────
+    # h5py cannot write dicts with integer keys, so uns gets string-keyed
+    # copies; the returned region_map / cluster_info keep their int keys.
+    region_map_str   = {str(k): v for k, v in region_map.items()}
+    cluster_info_str = {str(k): v for k, v in cluster_info.items()}
+
+    adata_list, V_true_temporal, warp_params = [], [], []
+    labels_temporal_sub, keep_indices = [], []
+    psi_x = rng.uniform(0, 2 * np.pi)
+    psi_y = rng.uniform(0, 2 * np.pi)
 
     for t in range(n_time):
         if t == 0:
@@ -619,74 +410,117 @@ def create_realistic_data(
             V_true_t, _ = _reconstruct_V_from_clusters(
                 V0, cluster_labels_temporal[t], type_names,
                 dom_frac=dom_frac, sec_frac=sec_frac, noise_frac=noise_frac,
-                dirichlet_alpha=dirichlet_alpha,
-                rng=rng,
+                dirichlet_alpha=dirichlet_alpha, rng=rng,
                 dom_override=dom_map, sec_override=sec_map,
             )
-        V_true_temporal.append(V_true_t)
-
-        frac_warp = t / max(n_time - 1, 1)
-        wp = dict(
-            ax    = warp_amplitude * frac_warp,
-            ay    = warp_amplitude * frac_warp,
-            f     = warp_freq,
-            psi_x = psi_x_fixed,
-            psi_y = psi_y_fixed,
-        )
+        frac = t / max(n_time - 1, 1)
+        wp = dict(ax=warp_amplitude * frac, ay=warp_amplitude * frac,
+                  f=warp_freq, psi_x=psi_x, psi_y=psi_y)
         warp_params.append(wp)
 
         warped = (_sine_warp(ref_coords, **wp) if warp_amplitude > 0
                   else ref_coords.copy())
-
-        scale_t = 1.0 + (extra_scale - 1.0) * frac_warp
-        theta_t = np.deg2rad(extra_rotate_deg) * frac_warp
-        R_t = np.array([[ np.cos(theta_t), np.sin(theta_t)],
+        scale_t = 1.0 + (extra_scale - 1.0) * frac
+        theta_t = np.deg2rad(extra_rotate_deg) * frac
+        R_t = np.array([[np.cos(theta_t), np.sin(theta_t)],
                         [-np.sin(theta_t), np.cos(theta_t)]])
         warped = scale_t * (R_t @ warped)
 
-        normalised, raw_counts = _generate_counts(
-            V_true_t, B_matrix, rng,
-            negbinom_r=negbinom_r, lib_mean=lib_mean, lib_sigma=lib_sigma,
+        # ── spot dropout ─────────────────────────────────────────────────
+        if dropout_frac > 0:
+            n_keep        = max(1, int(n_spots * (1 - dropout_frac)))
+            keep          = np.sort(rng.choice(n_spots, size=n_keep, replace=False))
+            warped_t      = warped[:, keep]
+            V_true_t_sub  = V_true_t[keep]
+            labels_t      = cluster_labels_temporal[t][keep]
+            base_labels_t = base_cluster_labels[keep]
+            spots_t       = [shared_spots[i] for i in keep]
+        else:
+            keep          = np.arange(n_spots)
+            warped_t      = warped
+            V_true_t_sub  = V_true_t
+            labels_t      = cluster_labels_temporal[t]
+            base_labels_t = base_cluster_labels
+            spots_t       = list(shared_spots)
+
+        # keep every returned per-slice array on the same (post-dropout) rows
+        V_true_temporal.append(V_true_t_sub)
+        labels_temporal_sub.append(labels_t)
+        keep_indices.append(keep)
+
+        normalised, raw = _generate_counts(
+            V_true_t_sub, B_matrix, rng, negbinom_r=negbinom_r,
+            lib_mean=lib_mean, lib_sigma=lib_sigma,
         )
 
-        adata_t                  = ad.AnnData(normalised)
-        adata_t.layers['counts'] = raw_counts
-        adata_t.obs['x']         = warped[0]
-        adata_t.obs['y']         = warped[1]
-        adata_t.obsm['spatial'] = warped.T.copy()   # (n_spots, 2)
-        adata_t.obs['cluster']   = pd.Categorical(cluster_labels_temporal[t])
-        adata_t.obs_names        = list(shared_spots)
-        adata_t.var_names        = gene_names
-        adata_t.obsm['V_true']        = V_true_t
-        adata_t.uns['warp_params']    = wp
-        adata_t.uns['B_true']         = B_matrix
-        adata_t.uns['time_index']     = t
-        adata_t.uns['cluster_info']   = cluster_info
-        adata_t.uns['cancer_clusters']= cancer_cluster_ids
+        obs_t = pd.DataFrame(
+            {
+                'x':         warped_t[0],
+                'y':         warped_t[1],
+                'cluster':   pd.Categorical(labels_t),
+                'region':    pd.Categorical(
+                    [region_map[int(l)] for l in labels_t]),
+                'region_t0': pd.Categorical(
+                    [region_map[int(l)] for l in base_labels_t]),
+            },
+            index=pd.Index([f"{s}-{t}" for s in spots_t], name=None),
+        )
+        var_t = pd.DataFrame(index=pd.Index(gene_names, name=None))
 
-        adata_list.append(adata_t)
-        n_cancer = sum(1 for l in cluster_labels_temporal[t]
-                       if int(l) in set(cancer_cluster_ids))
-        print(f"  t={t}  cancer spots={n_cancer}/{n_spots}  "
-              f"V range [{V_true_t.min():.3f}, {V_true_t.max():.3f}]")
+        a = ad.AnnData(
+            X=np.asarray(normalised, dtype=np.float32),
+            obs=obs_t,
+            var=var_t,
+        )
+        a.layers['counts'] = np.asarray(raw, dtype=np.float32)
+        a.obsm['spatial']  = warped_t.T.copy()
+        a.obsm['V_true']   = V_true_t_sub
+        a.uns['warp_params']     = wp
+        a.uns['B_true']          = B_matrix
+        a.uns['time_index']      = t
+        # string keys so the object is h5ad-writable (h5py rejects int keys)
+        a.uns['cluster_info']    = cluster_info_str
+        a.uns['cancer_clusters'] = cancer_cluster_ids
+        a.uns['region_map']      = region_map_str
+        adata_list.append(a)
 
-    # ── 10. Reference AnnData ────────────────────────────────────────────
-    ref_adata_out                = ad.AnnData(adata_list[0].X.copy())
-    ref_adata_out.obs['x']       = ref_coords[0]
-    ref_adata_out.obs['y']       = ref_coords[1]
-    ref_adata_out.obs['cluster'] = pd.Categorical(base_cluster_labels)
-    ref_adata_out.obs_names      = list(shared_spots)
-    ref_adata_out.var_names      = gene_names
-    ref_adata_out.obsm['V_true'] = V_structured
+        n_can = int(np.isin(labels_t, cancer_cluster_ids).sum())
+        print(f"  t={t}  spots={len(spots_t)}/{n_spots}  "
+              f"cancer={n_can}/{len(spots_t)} ({n_can / len(spots_t):.0%})")
 
-    return (
-        adata_list,
-        V_true_temporal,
-        cluster_labels_temporal,
-        ref_adata_out,
-        pd_B,
-        warp_params,
+    # ── 10. Reference ────────────────────────────────────────────────────
+    ref_norm, _ = _generate_counts(
+        V_structured, B_matrix, rng, negbinom_r=negbinom_r,
+        lib_mean=lib_mean, lib_sigma=lib_sigma,
     )
+    ref_obs = pd.DataFrame(
+        {
+            'x':       ref_coords[0],
+            'y':       ref_coords[1],
+            'cluster': pd.Categorical(base_cluster_labels),
+            'region':  pd.Categorical(
+                [region_map[int(l)] for l in base_cluster_labels]),
+        },
+        index=pd.Index(list(shared_spots), name=None),
+    )
+    ref_out = ad.AnnData(
+        X=np.asarray(ref_norm, dtype=np.float32),
+        obs=ref_obs,
+        var=pd.DataFrame(index=pd.Index(gene_names, name=None)),
+    )
+    ref_out.obsm['spatial'] = ref_coords.T.copy()
+    ref_out.obsm['V_true']  = V_structured
+
+    # cluster_labels_temporal is full-length (n_spots) because the invasion
+    # model runs on the full grid; return the dropout-matched version so it
+    # lines up with adata_list / V_true_temporal row-for-row.
+    cluster_labels_temporal = labels_temporal_sub
+    ref_out.uns['keep_indices'] = keep_indices
+
+    return (adata_list, V_true_temporal, cluster_labels_temporal,
+            ref_out, pd_B, warp_params, region_map)
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -711,6 +545,7 @@ def program_recovery_cosine(B_true, B_pred):
     )
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Visualization
 # ─────────────────────────────────────────────────────────────────────────────
@@ -732,23 +567,20 @@ def scatter_pies(
     keep_labels=None, others_label="Others", others_color=None,
 ):
     x = np.asarray(x); y = np.asarray(y)
-    P = np.asarray(percents, float)
-    P = np.nan_to_num(P, nan=0.0)
+    P = np.nan_to_num(np.asarray(percents, float), nan=0.0)
     n, k = P.shape
-    if labels is None:
-        labels = [f"C{i+1}" for i in range(k)]
-    else:
-        labels = list(labels)
+    labels = [f"C{i+1}" for i in range(k)] if labels is None else list(labels)
 
     if keep_labels is not None:
         label_to_idx = {lab: i for i, lab in enumerate(labels)}
         keep_idx  = [label_to_idx[lb] for lb in keep_labels]
         drop_mask = np.ones(k, dtype=bool); drop_mask[keep_idx] = False
         drop_idx  = np.where(drop_mask)[0]
-        P_keep    = P[:, keep_idx]
-        P_others  = P[:, drop_idx].sum(axis=1, keepdims=True) if drop_idx.size > 0 else np.zeros((n, 1))
+        P_keep   = P[:, keep_idx]
+        P_others = (P[:, drop_idx].sum(axis=1, keepdims=True)
+                    if drop_idx.size > 0 else np.zeros((n, 1)))
         P = np.concatenate([P_keep, P_others], axis=1)
-        labels = keep_labels + [others_label]; k = P.shape[1]
+        labels = list(keep_labels) + [others_label]; k = P.shape[1]
         if colors is not None:
             new_colors = [colors[i] for i in keep_idx]
             if others_color is None:
@@ -758,27 +590,25 @@ def scatter_pies(
     rs = P.sum(axis=1, keepdims=True); rs[rs == 0] = 1.0; P = P / rs
 
     if top_n is not None and top_n < k:
-        avg = P.mean(axis=0)
-        keep_idx = np.argsort(avg)[::-1][:top_n]
+        keep_idx = np.argsort(P.mean(axis=0))[::-1][:top_n]
         P = P[:, keep_idx]; labels = [labels[i] for i in keep_idx]; k = top_n
         colors = [colors[i] for i in keep_idx] if colors is not None else None
 
     if colors is None:
-        cmap = plt.get_cmap("tab20")
-        colors = [cmap(i % 20) for i in range(k)]
+        colors = _colors(k)
 
     if mode == "full":
         for xi, yi, fracs in zip(x, y, P):
             theta = start_angle
             for f, c in zip(fracs, colors):
-                if f <= 0: continue
+                if f <= 0:
+                    continue
                 ax.add_patch(Wedge((xi, yi), r=radius,
                                    theta1=theta, theta2=theta + 360.0 * f,
                                    facecolor=c, edgecolor=edgecolor, linewidth=lw))
                 theta += 360.0 * f
     elif mode == "argmax":
-        max_idx = np.argmax(P, axis=1)
-        for xi, yi, j in zip(x, y, max_idx):
+        for xi, yi, j in zip(x, y, np.argmax(P, axis=1)):
             ax.add_patch(Wedge((xi, yi), r=radius, theta1=0, theta2=360,
                                facecolor=colors[j], edgecolor=edgecolor, linewidth=lw))
 
@@ -795,8 +625,10 @@ def scatter_pies(
 
 
 def plot_domain_maps(adata_list, V_true_temporal, pd_B,
-                     max_slices=6, radius=0.35, mode="full", figsize=None):
-    """Per-slice pie chart visualisation of V_true."""
+                     max_slices=6, radius=0.35, mode="full", figsize=None,
+                     keep_labels=None):
+    """Per-slice pie visualisation of V_true. keep_labels collapses the rest
+    into 'Others' — with K=20 that is usually what you want."""
     n_show     = min(len(adata_list), max_slices)
     type_names = list(pd_B.index)
     colors     = _colors(len(type_names))
@@ -804,139 +636,179 @@ def plot_domain_maps(adata_list, V_true_temporal, pd_B,
     ncols = min(n_show, 5)
     nrows = int(np.ceil(n_show / ncols))
     fig, axes = plt.subplots(nrows, ncols,
-                              figsize=figsize or (7 * ncols, 6.5 * nrows))
+                             figsize=figsize or (5 * ncols, 5 * nrows))
     axes = np.array(axes).ravel()
 
     handles = None
     for t in range(n_show):
-        ax = axes[t]
-        ad_t = adata_list[t]
         handles = scatter_pies(
-            ax,
-            x=ad_t.obs['x'].values, y=ad_t.obs['y'].values,
+            axes[t],
+            x=adata_list[t].obs['x'].values, y=adata_list[t].obs['y'].values,
             percents=V_true_temporal[t],
             radius=radius, labels=type_names, colors=colors,
-            mode=mode, leg_vis=False,
+            mode=mode, leg_vis=False, keep_labels=keep_labels,
         )
-        ax.set_title(f"Slice  t = {t}", fontsize=11)
-        ax.axis('off')
+        axes[t].set_title(f"t = {t}", fontsize=11)
+        axes[t].axis('off')
 
     if handles:
         fig.legend(handles=handles, title="Cell types", frameon=False,
-                   loc="lower center", ncol=min( len(type_names),5),
-                   bbox_to_anchor=(0.5, -0.1), fontsize=16)
-
+                   loc="lower center", ncol=min(len(handles), 5),
+                   bbox_to_anchor=(0.5, -0.04), fontsize=8)
     for ax in axes[n_show:]:
         ax.axis('off')
-
-    fig.suptitle(f"Ground-truth compositions  (mode='{mode}')", fontsize=13)
+    fig.suptitle(f"Ground-truth compositions (mode='{mode}')", fontsize=13)
     fig.tight_layout()
     return fig
 
 
-def plot_cluster_maps(adata_list, max_slices=6, figsize=None, s=10,
-                      type_names=None):
-    """Per-slice scatter coloured by ground-truth cluster label."""
+def plot_region_maps(adata_list, max_slices=6, figsize=None, s=20,
+                     region_colors=None):
+    """Per-slice scatter coloured by obs['region'] — the PDAC-A figure layout."""
     n_show = min(len(adata_list), max_slices)
-    all_labels = set()
-    for adt in adata_list[:n_show]:
-        all_labels.update(np.asarray(adt.obs['cluster']).astype(int).tolist())
-    all_labels = sorted(int(l) for l in all_labels)
-    color_map = {lab: _colors(len(all_labels))[i] for i, lab in enumerate(all_labels)}
+    region_map = adata_list[0].uns.get('region_map', {})
+
+    names = []
+    for a in adata_list[:n_show]:
+        for r in pd.unique(a.obs['region']):
+            if r not in names:
+                names.append(str(r))
+    names = sorted(names)
+
+    default = {'cancer_A': '#F1665A', 'cancer_B': '#F7E463',
+               'cancer': '#F1665A', 'pancreatic': '#7EB6E8',
+               'duct epthelium': '#E8A020', 'duct epithelium': '#E8A020',
+               'stroma': '#A8A8A8'}
+    if region_colors is None:
+        region_colors = {}
+    cmap = {r: region_colors.get(r, default.get(r, _colors(len(names))[i]))
+            for i, r in enumerate(names)}
 
     ncols = min(n_show, 5)
     nrows = int(np.ceil(n_show / ncols))
     fig, axes = plt.subplots(nrows, ncols,
-                             figsize=figsize or (5 * ncols, 5 * nrows))
+                             figsize=figsize or (4 * ncols, 4 * nrows))
     axes = np.array(axes).ravel()
 
-    cancer_clusters = set()
-    if 'cancer_clusters' in adata_list[0].uns:
-        cancer_clusters = set(int(c) for c in adata_list[0].uns['cancer_clusters'])
-
-    # Build cluster→dominant-name lookup for legend, if available.
-    dom_name = {}
-    if type_names is not None and 'cluster_info' in adata_list[0].uns:
-        for c, info in adata_list[0].uns['cluster_info'].items():
-            dom_name[int(c)] = type_names[info['dominant']]
-
+    cancer_ids = set(int(c) for c in adata_list[0].uns.get('cancer_clusters', []))
     for t in range(n_show):
-        ax = axes[t]
-        adt = adata_list[t]
-        labs = np.asarray(adt.obs['cluster']).astype(int)
-        c = [color_map[int(l)] for l in labs]
-        ax.scatter(adt.obs['x'].values, adt.obs['y'].values, c=c, s=s,
-                   linewidths=0, rasterized=True)
-        n_cancer = int(np.isin(labs, list(cancer_clusters)).sum()) if cancer_clusters else 0
+        a = adata_list[t]
+        c = [cmap[str(r)] for r in a.obs['region']]
+        axes[t].scatter(a.obs['x'].values, a.obs['y'].values, c=c, s=s,
+                        linewidths=0, rasterized=True)
         title = f"t = {t}"
-        if cancer_clusters:
-            title += f"   cancer={n_cancer}/{len(labs)}"
-        ax.set_title(title, fontsize=11)
-        ax.set_aspect('equal'); ax.axis('off')
+        if cancer_ids:
+            n_can = int(np.isin(np.asarray(a.obs['cluster']).astype(int),
+                                list(cancer_ids)).sum())
+            title += f"   cancer={n_can}/{a.n_obs}"
+        axes[t].set_title(title, fontsize=11)
+        axes[t].set_aspect('equal'); axes[t].axis('off')
 
-    def _legend_label(lab):
-        s = f"cluster {lab}"
-        if lab in dom_name:
-            s += f": {dom_name[lab]}"
-        if lab in cancer_clusters:
-            s += "  (cancer)"
-        return s
-
-    handles = [Patch(facecolor=color_map[lab], label=_legend_label(lab))
-               for lab in all_labels]
+    handles = [Patch(facecolor=cmap[r], label=r) for r in names]
     fig.legend(handles=handles, frameon=False, loc='lower center',
-               ncol=len(all_labels), bbox_to_anchor=(0.5, -0.02),
-               fontsize=16)
-
+               ncol=min(len(names), 5), bbox_to_anchor=(0.5, -0.04), fontsize=9)
     for ax in axes[n_show:]:
         ax.axis('off')
-    fig.suptitle("Ground-truth cluster labels", fontsize=13)
+    fig.suptitle("Ground-truth regions", fontsize=13)
     fig.tight_layout()
     return fig
 
 
+def plot_warp_distortion(adata_list, ref_adata=None, max_slices=5,
+                         n_sample=2000, figsize=None):
+    """Grey = t0 coordinates, colour = slice t. ref_adata is ignored."""
+    n_show = min(len(adata_list), max_slices)
+    colors = _colors(n_show)
+    ncols  = min(n_show, 5)
+    nrows  = int(np.ceil(n_show / ncols))
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=figsize or (4 * ncols, 4 * nrows))
+    axes = np.array(axes).ravel()
+
+    a0 = adata_list[0]
+    rx, ry = a0.obs['x'].values, a0.obs['y'].values
+    ridx = np.random.default_rng(0).choice(
+        len(rx), size=min(n_sample, len(rx)), replace=False)
+
+    for t in range(n_show):
+        a = adata_list[t]
+        idx = np.random.default_rng(t).choice(
+            a.n_obs, size=min(n_sample, a.n_obs), replace=False)
+
+        axes[t].scatter(rx[ridx], ry[ridx], s=4, c='#cccccc',
+                        linewidths=0, label='t=0', rasterized=True)
+        axes[t].scatter(a.obs['x'].values[idx], a.obs['y'].values[idx],
+                        s=4, c=[colors[t]], linewidths=0, alpha=0.6,
+                        label=f't={t}', rasterized=True)
+        axes[t].set_title(f"Warp  t = {t}   n={a.n_obs}", fontsize=11)
+        axes[t].set_aspect('equal'); axes[t].axis('off')
+        axes[t].legend(fontsize=7, loc='upper left', markerscale=3,
+                       frameon=False)
+
+    for ax in axes[n_show:]:
+        ax.axis('off')
+    fig.suptitle("t=0 (grey) vs warped coordinates", fontsize=13)
+    fig.tight_layout()
+    return fig
 
 
-def visualize_all(adata_list, V_true_temporal, pd_B, warp_params, ref_adata,
-                  radius=0.35, mode="full", save_prefix=None,
-                  view="composition", **kwargs):
+def plot_count_stats(adata_list, figsize=(12, 4)):
+    n_slices = len(adata_list)
+    colors   = _colors(n_slices)
+    totals, sparsity = [], []
+    for a in adata_list:
+        raw = a.layers['counts'] if 'counts' in a.layers else a.X
+        if hasattr(raw, 'toarray'):
+            raw = raw.toarray()
+        raw = np.asarray(raw)
+        totals.append(raw.sum(axis=1)); sparsity.append((raw == 0).mean())
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+    parts = ax1.violinplot(totals, positions=range(n_slices),
+                           showmedians=True, showextrema=False)
+    for i, pc in enumerate(parts['bodies']):
+        pc.set_facecolor(colors[i]); pc.set_alpha(0.7)
+    parts['cmedians'].set_color('black')
+    ax1.set_xticks(range(n_slices))
+    ax1.set_xticklabels([f"t={t}" for t in range(n_slices)])
+    ax1.set_ylabel("Total UMI counts per spot")
+    ax1.set_title("Library size distribution")
+
+    bars = ax2.bar(range(n_slices), sparsity, color=colors[:n_slices],
+                   edgecolor='white')
+    ax2.set_xticks(range(n_slices))
+    ax2.set_xticklabels([f"t={t}" for t in range(n_slices)])
+    ax2.set_ylabel("Fraction of zeros"); ax2.set_ylim(0, 1)
+    ax2.set_title("Sparsity per slice")
+    for bar, val in zip(bars, sparsity):
+        ax2.text(bar.get_x() + bar.get_width() / 2, val + 0.01,
+                 f"{val:.2f}", ha='center', va='bottom', fontsize=9)
+    fig.suptitle("Count statistics", fontsize=13)
+    fig.tight_layout()
+    return fig
+
+
+def visualize_all(adata_list, V_true_temporal, pd_B, ref_adata=None,
+                  view="regions", radius=0.35, mode="full",
+                  keep_labels=None, save_prefix=None):
     """
-    Generate all visualisation figures.
-
-    Parameters
-    ----------
-    view : {'composition', 'clusters', 'both'}
-        - 'composition' (default): per-slice spatial map shows pie-chart
-          cell-type compositions from V_true.
-        - 'clusters': per-slice spatial map shows ground-truth cluster
-          labels as flat scatter colours.
-        - 'both': include both 'domains' (composition pies) and
-          'clusters' (label scatter) figures.
-        The 'warp' and 'counts' figures are always included.
-    radius : float
-        Pie radius for composition mode — tune to your coordinate scale.
-    mode : {'full', 'argmax'}
-        Passed through to scatter_pies when view includes composition.
-    save_prefix : str or None
-        If given, saves {save_prefix}_{name}.png for each figure.
+    view : 'regions' | 'composition' | 'both'
+        'regions'     — scatter coloured by obs['region'] (the Fig. 2a layout)
+        'composition' — pie charts of V_true
     """
-    if view not in ('composition', 'clusters', 'both'):
-        raise ValueError(
-            f"view must be 'composition', 'clusters', or 'both'; got '{view}'"
-        )
+    if view not in ('regions', 'composition', 'both'):
+        raise ValueError("view must be 'regions', 'composition' or 'both'")
 
     figs = {}
-    type_names = list(pd_B.index)
-
+    if view in ('regions', 'both'):
+        figs['regions'] = plot_region_maps(adata_list)
     if view in ('composition', 'both'):
-        figs['domains'] = plot_domain_maps(
-            adata_list, V_true_temporal, pd_B,
-            radius=radius, mode=mode,
-        )
-    if view in ('clusters', 'both'):
-        figs['clusters'] = plot_cluster_maps(adata_list, type_names=type_names, s=30)
-
-
+        figs['domains'] = plot_domain_maps(adata_list, V_true_temporal, pd_B,
+                                           radius=radius, mode=mode,
+                                           keep_labels=keep_labels)
+    if ref_adata is not None:
+        figs['warp'] = plot_warp_distortion(adata_list, ref_adata)
+    figs['counts'] = plot_count_stats(adata_list)
 
     if save_prefix:
         for name, fig in figs.items():

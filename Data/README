@@ -1,6 +1,0 @@
-This folder hosts simulation and real data processing files. 
-
-The simulation follows a warping model taking in the PDAC slice.
-
-The real spatial datasets are typically UMI normalized to 1e4 counts. Their single cell references were normalized in the same way. 
-In particular, we selected informative genes that has log fold change above 1.25, and intersect with available genes in the spatial data.
