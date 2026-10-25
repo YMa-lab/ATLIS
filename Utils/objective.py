@@ -210,7 +210,7 @@ def proj_simplex_rows(V, z=1.0, proj=False):
 def solve_V_universal(
     X, B, L,
     niter_max=1e3, tol=1e-5, eta=1e-3, verbose=True,
-    V0=None, return_obj=False, proj_simplex=False, step_rate="backtrack",
+    V0=None, return_obj=False, proj_simplex=False, step_rate="backtrack",random_state = 0
 ):
     """Projected gradient descent on V, never forming the residual X - B V^T.
 
@@ -245,7 +245,7 @@ def solve_V_universal(
         return 2.0 * (V @ H - G) + 2.0 * (L @ V)
 
     if V0 is None:
-        V = np.random.default_rng(0).random((n, r), dtype=float)
+        V = np.random.default_rng(random_state).random((n, r), dtype=float)
     else:
         V = np.asarray(V0, dtype=float)
         assert V.shape == (n, r)
@@ -304,8 +304,18 @@ def solve_V_universal(
 def solve_V_per_slice(
     adata, pd_B, lam=10, k=20, niter_max=1e3, tol=1e-5, eta=1e-3,
     verbose=True, return_obj=False, proj_simplex=False, step_rate="backtrack",
+    normalize_terms=True,
 ):
-    """Deconvolve a single slice with only its own spatial Laplacian."""
+    """Deconvolve one slice with spatial regularization.
+
+    With ``normalize_terms=True``, the optimized objective is proportional to
+
+        ||X - B V^T||_F^2 / (n_spots * n_genes)
+        + lam * tr(V^T L V) / tr(L).
+
+    The solver itself keeps an unnormalized data term, so the Laplacian is
+    rescaled by (n_spots * n_genes) / tr(L), which gives the same minimizer.
+    """
     common = adata.var_names.intersection(pd_B.columns)
     adata_sub = adata[:, common].copy()
 
@@ -316,8 +326,15 @@ def solve_V_per_slice(
     )
     X = adata_sub.layers["counts"].T if "counts" in adata_sub.layers else adata_sub.X.T
 
+    if normalize_terms:
+        data_scale = float(X.shape[0] * X.shape[1])
+        spatial_scale = float(L.diagonal().sum() if sp.issparse(L) else np.trace(L))
+        lam_eff = lam * data_scale / max(spatial_scale, 1e-15)
+    else:
+        lam_eff = lam
+
     return solve_V_universal(
-        X, pd_B[common].to_numpy().T, lam * L,
+        X, pd_B[common].to_numpy().T, lam_eff * L,
         niter_max=niter_max, tol=tol, eta=eta, verbose=verbose,
         return_obj=return_obj, proj_simplex=proj_simplex, step_rate=step_rate,
     )
@@ -417,29 +434,218 @@ def _compute_coupling(
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
+# def solve_V_all_slices(
+#     adata_group, pd_B,
+#     lam=10, mu=1, time=None,
+#     outer_max=5, niter_max=1e3, tol=1e-5, eta=1e-3,
+#     verbose=True, coupling=None, k=10, init="per_slice",
+#     V_init=None, ot_solver="fgw", one_step=True,
+#     step_rate="automatic", alpha=0.5,
+#     dtype=np.float32,
+#     sparsify=False
+# ):
+#     """Learns cell type program scores across all slices jointly, coupling consecutive time points via OT.
+
+#     Alternates between (i) computing couplings pi_t between adjacent slices and
+#     (ii) solving for V under a block Laplacian that combines each slice's
+#     spatial graph with the coupling-induced cross-slice penalty, weighted by mu.
+#     `mu < 0` skips the V update entirely and only returns the couplings.
+
+#     V is dense by design; the couplings are sparsified after solving, but the
+#     OT solvers themselves still build dense cost matrices.
+
+#     Returns (V_per_slice, pi_list, L).
+#     """
+#     rng = np.random.default_rng(0)
+#     n_times = len(adata_group)
+
+#     n_spots = [0]
+#     for a_i in adata_group:
+#         n_spots.append(n_spots[-1] + a_i.shape[0])
+
+#     adata = ad.concat(adata_group, axis=0, join="outer")
+#     common = adata.var_names.intersection(pd_B.columns)
+
+#     adata_sub = adata[:, common].copy()
+#     adata_group = [a_i[:, common].copy() for a_i in adata_group]
+#     pd_B_sub = pd_B[common]
+
+#     if time is None:
+#         time = list(range(n_times))
+#     if time[-1] == time[0]:
+#         rescaled_time = [0.0] * len(time)
+#     else:
+#         span = time[-1] - time[0]
+#         rescaled_time = [(t - time[0]) / span for t in time]
+
+#     base_diag_blocks = []
+#     for a_i in adata_group:
+#         Li, _ = laplacian_from_coords(
+#             a_i.obs["x"].to_numpy(), a_i.obs["y"].to_numpy(), k=k, normed=True
+#         )
+#         if not sp.issparse(Li):
+#             Li = sp.csr_matrix(Li)
+#         base_diag_blocks.append((lam * Li).tocsr())
+
+#     B = np.asarray(pd_B_sub.to_numpy().T, dtype=dtype)
+
+#     X = adata_sub.X.T
+#     X = (
+#         X.tocsr().astype(dtype) if sp.issparse(X)
+#         else sp.csr_matrix(np.asarray(X, dtype=dtype))
+#     )
+
+#     G = X.T @ B
+#     if sp.issparse(G):
+#         G = G.toarray()
+#     G = np.asarray(G, dtype=dtype)
+
+#     H = (B.T @ B).astype(dtype, copy=False)
+#     xnorm2 = float(X.multiply(X).sum())
+
+#     def objective(V, L):
+#         data = xnorm2 - 2.0 * float(np.sum(V * G)) + float(np.sum((V @ H) * V))
+#         return data + float(np.sum((L @ V) * V))
+
+#     if V_init is None:
+#         V_init = []
+#         for a_i in adata_group:
+#             V_i = np.asarray(
+#                 solve_V_per_slice(
+#                     a_i, pd_B_sub, lam=lam, k=k, eta=eta, step_rate=step_rate
+#                 ),
+#                 dtype=dtype,
+#             )
+#             if init == "random":
+#                 V_i = rng.random(V_i.shape, dtype=float).astype(dtype)
+#                 V_i = V_i / (V_i.sum(axis=1, keepdims=True) + 1e-15)
+#             V_init.append(V_i)
+#     else:
+#         V_init = [np.asarray(V_i, dtype=dtype) for V_i in V_init]
+
+#     V = np.vstack(V_init).astype(dtype, copy=False)
+
+#     if one_step:
+#         outer_max = 1
+#     if mu < 0:
+#         outer_max = -1
+
+#     L = assemble_blocks([blk.copy() for blk in base_diag_blocks]).tocsr()
+#     f_prev = objective(V, L)
+#     pi = [None] * (n_times - 1)
+
+#     for iter_outer in range(outer_max):
+#         diag_blocks = [blk.copy() for blk in base_diag_blocks]
+#         off_diag_blocks = []
+
+#         for i in range(n_times - 1):
+#             n_i, n_ip = adata_group[i].n_obs, adata_group[i + 1].n_obs
+#             a = np.full(n_i, 1.0 / n_i, dtype=dtype)
+#             b = np.full(n_ip, 1.0 / n_ip, dtype=dtype)
+
+#             if coupling is None:
+#                 C = scipy.spatial.distance.cdist(
+#                     V_init[i].astype(np.float64, copy=False),
+#                     V_init[i + 1].astype(np.float64, copy=False),
+#                     metric="sqeuclidean",
+#                 )
+#                 C = C / (C.max() + 1e-15)
+#                 pi_i = _compute_coupling(
+#                     ot_solver, C,
+#                     adata_group[i], adata_group[i + 1],
+#                     V_init[i], V_init[i + 1],
+#                     a, b, alpha, verbose,
+#                 )
+#             else:
+#                 pi_i = np.asarray(coupling[i], dtype=dtype)
+
+#             if sparsify:
+#                 pi_i = sparsify_pi_sparse(pi_i, k_row=int(k / 4), k_col=int(k / 4))
+#             pi_i = pi_i / (pi_i.sum() + 1e-15)
+#             pi_i = pi_i * np.sqrt(pi_i.shape[0] * pi_i.shape[1])
+
+#             dt = rescaled_time[i + 1] - rescaled_time[i]
+#             if dt != 0:
+#                 pi_i = pi_i / dt
+#             pi[i] = pi_i
+
+#             a_marg = np.asarray(pi_i.sum(axis=1)).ravel()
+#             b_marg = np.asarray(pi_i.sum(axis=0)).ravel()
+
+#             diag_blocks[i] = diag_blocks[i] + mu * sp.diags(a_marg, format="csr")
+#             diag_blocks[i + 1] = diag_blocks[i + 1] + mu * sp.diags(b_marg, format="csr")
+
+#             off_diag_blocks.append((i, i + 1, -mu * pi_i))
+#             off_diag_blocks.append((i + 1, i, -mu * pi_i.T))
+
+#         L = assemble_blocks(diag_blocks, offdiag_blocks=off_diag_blocks).tocsr()
+
+#         if mu >= 0:
+#             V = solve_V_universal(
+#                 X, B, L,
+#                 niter_max=niter_max, tol=tol, eta=eta,
+#                 verbose=verbose, V0=V, step_rate=step_rate,
+#             ).astype(dtype, copy=False)
+
+#             for i in range(n_times):
+#                 V_init[i] = V[n_spots[i]:n_spots[i + 1], :]
+
+#         f_curr = objective(V, L)
+#         rel_drop = (f_prev - f_curr) / max(1.0, abs(f_prev))
+
+#         if verbose and (iter_outer % 50 == 0 or rel_drop < tol):
+#             print(f"iter {iter_outer:4d}  f={f_curr:.6e}  rel_drop={rel_drop:.3e}")
+
+#         if f_curr <= f_prev and rel_drop < tol:
+#             if verbose:
+#                 print("stopped after iteration #", iter_outer)
+#             break
+
+#         f_prev = f_curr
+
+#     return V_init, pi, L
+
 def solve_V_all_slices(
     adata_group, pd_B,
-    lam=10, mu=1, time=None,
+    lam=None, mu=None, time=None,
     outer_max=5, niter_max=1e3, tol=1e-5, eta=1e-3,
     verbose=True, coupling=None, k=10, init="per_slice",
     V_init=None, ot_solver="fgw", one_step=True,
     step_rate="automatic", alpha=0.5,
     dtype=np.float32,
-    sparsify=False
+    sparsify=False,
+    random_state=0,
+    return_ratio=False,
+    target_spatial_ratio=0.01,
+    target_temporal_ratio=0.01,
 ):
-    """Learns cell type program scores across all slices jointly, coupling consecutive time points via OT.
+    """Learn cell-type program scores jointly across ordered slices.
 
-    Alternates between (i) computing couplings pi_t between adjacent slices and
-    (ii) solving for V under a block Laplacian that combines each slice's
-    spatial graph with the coupling-induced cross-slice penalty, weighted by mu.
-    `mu < 0` skips the V update entirely and only returns the couplings.
+    This keeps the original, unnormalized objective
 
-    V is dense by design; the couplings are sparsified after solving, but the
-    OT solvers themselves still build dense cost matrices.
+        D(V) + lam * S(V) + mu * T(V; pi)
 
-    Returns (V_per_slice, pi_list, L).
+    and the original coupling construction.
+
+    lam and mu are each INDEPENDENTLY either:
+      - None: auto-computed once so that the corresponding regularizer is
+        approximately `target_spatial_ratio` / `target_temporal_ratio` of the
+        data-fitting term at the state where it is introduced, or
+      - a fixed numeric value: used directly, no calibration.
+
+    So you can mix and match, e.g. lam=0.3 (fixed) with mu=None (ratio-based),
+    or vice versa, or both fixed, or both auto (the default, lam=None, mu=None).
+
+    mu=-1 remains a special sentinel meaning "spatial-only, skip OT/temporal
+    entirely" (unchanged from before).
+
+    Returns (V_per_slice, pi_list, L), with optional final realized
+    spatial/data and temporal/data ratios when ``return_ratio=True``.
     """
-    rng = np.random.default_rng(0)
+    auto_lam = lam is None
+    auto_mu = mu is None
+
+    rng = np.random.default_rng(random_state)
     n_times = len(adata_group)
 
     n_spots = [0]
@@ -448,11 +654,11 @@ def solve_V_all_slices(
 
     adata = ad.concat(adata_group, axis=0, join="outer")
     common = adata.var_names.intersection(pd_B.columns)
-
     adata_sub = adata[:, common].copy()
     adata_group = [a_i[:, common].copy() for a_i in adata_group]
     pd_B_sub = pd_B[common]
 
+    # Preserve the original time convention.
     if time is None:
         time = list(range(n_times))
     if time[-1] == time[0]:
@@ -461,14 +667,16 @@ def solve_V_all_slices(
         span = time[-1] - time[0]
         rescaled_time = [(t - time[0]) / span for t in time]
 
-    base_diag_blocks = []
+    spatial_blocks = []
     for a_i in adata_group:
         Li, _ = laplacian_from_coords(
-            a_i.obs["x"].to_numpy(), a_i.obs["y"].to_numpy(), k=k, normed=True
+            a_i.obs["x"].to_numpy(),
+            a_i.obs["y"].to_numpy(),
+            k=k, normed=True,
         )
         if not sp.issparse(Li):
             Li = sp.csr_matrix(Li)
-        base_diag_blocks.append((lam * Li).tocsr())
+        spatial_blocks.append(Li.tocsr())
 
     B = np.asarray(pd_B_sub.to_numpy().T, dtype=dtype)
 
@@ -486,105 +694,808 @@ def solve_V_all_slices(
     H = (B.T @ B).astype(dtype, copy=False)
     xnorm2 = float(X.multiply(X).sum())
 
-    def objective(V, L):
-        data = xnorm2 - 2.0 * float(np.sum(V * G)) + float(np.sum((V @ H) * V))
-        return data + float(np.sum((L @ V) * V))
+    def data_term(V):
+        return (
+            xnorm2
+            - 2.0 * float(np.sum(V * G))
+            + float(np.sum((V @ H) * V))
+        )
 
+    # 1) Unregularized reference V0 (also used as init for the spatial solve,
+    #    regardless of whether lam ends up auto or fixed).
     if V_init is None:
-        V_init = []
-        for a_i in adata_group:
+        V0_list = []
+        for i, Li in enumerate(spatial_blocks):
+            Xi = X[:, n_spots[i]:n_spots[i + 1]]
+            L0 = sp.csr_matrix(Li.shape, dtype=dtype)
             V_i = np.asarray(
-                solve_V_per_slice(
-                    a_i, pd_B_sub, lam=lam, k=k, eta=eta, step_rate=step_rate
+                solve_V_universal(
+                    Xi, B, L0,
+                    niter_max=niter_max, tol=tol, eta=eta,
+                    verbose=False, step_rate=step_rate,
+                    random_state=random_state,
                 ),
                 dtype=dtype,
             )
             if init == "random":
-                V_i = rng.random(V_i.shape, dtype=float).astype(dtype)
+                V_i = rng.random(V_i.shape).astype(dtype)
                 V_i = V_i / (V_i.sum(axis=1, keepdims=True) + 1e-15)
-            V_init.append(V_i)
+            V0_list.append(V_i)
     else:
-        V_init = [np.asarray(V_i, dtype=dtype) for V_i in V_init]
+        V0_list = [np.asarray(V_i, dtype=dtype) for V_i in V_init]
 
-    V = np.vstack(V_init).astype(dtype, copy=False)
+    V0 = np.vstack(V0_list).astype(dtype, copy=False)
 
-    if one_step:
-        outer_max = 1
-    if mu < 0:
-        outer_max = -1
+    # 2) Choose lambda: auto from the unregularized strengths, or use as given.
+    if auto_lam:
+        D0 = data_term(V0)
+        L_spatial_raw = assemble_blocks([blk.copy() for blk in spatial_blocks]).tocsr()
+        S0 = float(np.sum((L_spatial_raw @ V0) * V0))
+        lam_used = target_spatial_ratio * D0 / max(S0, 1e-30)
+    else:
+        lam_used = lam
 
-    L = assemble_blocks([blk.copy() for blk in base_diag_blocks]).tocsr()
-    f_prev = objective(V, L)
+    if verbose:
+        print(f"lambda used = {lam_used:.6e}" + (" (auto)" if auto_lam else " (fixed)"))
+
+    # 3) Spatial-only solve with the chosen lambda.
+    base_diag_blocks = [(lam_used * Li).tocsr() for Li in spatial_blocks]
+    L_base = assemble_blocks([blk.copy() for blk in base_diag_blocks]).tocsr()
+
+    V_spatial = []
+    for i, Li_scaled in enumerate(base_diag_blocks):
+        Xi = X[:, n_spots[i]:n_spots[i + 1]]
+        V_i = np.asarray(
+            solve_V_universal(
+                Xi, B, Li_scaled,
+                niter_max=niter_max, tol=tol, eta=eta,
+                verbose=False, V0=V0_list[i], step_rate=step_rate,
+                random_state=random_state,
+            ),
+            dtype=dtype,
+        )
+        V_spatial.append(V_i)
+
+    V = np.vstack(V_spatial).astype(dtype, copy=False)
+
+    # Special case: mu = -1 means spatial-only; skip OT coupling entirely.
+    if mu == -1:
+        if verbose:
+            print("mu = -1: skipping OT coupling and temporal regularization.")
+
+        pi = [None] * (n_times - 1)
+        L = L_base
+
+        V_out = [
+            V[n_spots[i]:n_spots[i + 1], :]
+            for i in range(n_times)
+        ]
+
+        if return_ratio or verbose:
+            spatial = float(np.sum((L_base @ V) * V))
+            data = data_term(V)
+
+            if verbose:
+                print(f"final spatial/data ratio  = {spatial / data:.6e}")
+                print("final temporal/data ratio = 0.000000e+00")
+
+            if return_ratio:
+                return V_out, pi, L, data, spatial / data, 0.0
+
+        return V_out, pi, L
+
+    # 4) Compute the actual OT coupling ONCE from the spatially regularized V.
     pi = [None] * (n_times - 1)
 
-    for iter_outer in range(outer_max):
-        diag_blocks = [blk.copy() for blk in base_diag_blocks]
-        off_diag_blocks = []
+    for i in range(n_times - 1):
+        n_i, n_ip = adata_group[i].n_obs, adata_group[i + 1].n_obs
+        a = np.full(n_i, 1.0 / n_i, dtype=dtype)
+        b = np.full(n_ip, 1.0 / n_ip, dtype=dtype)
 
-        for i in range(n_times - 1):
-            n_i, n_ip = adata_group[i].n_obs, adata_group[i + 1].n_obs
-            a = np.full(n_i, 1.0 / n_i, dtype=dtype)
-            b = np.full(n_ip, 1.0 / n_ip, dtype=dtype)
+        if coupling is None:
+            C = scipy.spatial.distance.cdist(
+                V_spatial[i].astype(np.float64, copy=False),
+                V_spatial[i + 1].astype(np.float64, copy=False),
+                metric="sqeuclidean",
+            )
+            C = C / (C.max() + 1e-15)
+            pi_i = _compute_coupling(
+                ot_solver, C,
+                adata_group[i], adata_group[i + 1],
+                V_spatial[i], V_spatial[i + 1],
+                a, b, alpha, verbose,
+            )
+        else:
+            pi_raw = coupling[i]
+            if sp.issparse(pi_raw):
+                pi_i = pi_raw.tocsr().astype(dtype, copy=False)
+            else:
+                pi_i = np.asarray(pi_raw, dtype=dtype)
 
-            if coupling is None:
+        if sparsify:
+            pi_i = sparsify_pi_sparse(
+                pi_i, k_row=max(1, int(k / 4)), k_col=max(1, int(k / 4))
+            )
+
+        # Preserve the original coupling scaling.
+        pi_i = pi_i / (pi_i.sum() + 1e-15)
+        pi_i = pi_i * np.sqrt(pi_i.shape[0] * pi_i.shape[1])
+
+        dt = rescaled_time[i + 1] - rescaled_time[i]
+        if dt != 0:
+            pi_i = pi_i / dt
+
+        pi[i] = pi_i
+
+    # 5) Choose mu: auto from the bare temporal quadratic at V_spatial, or use
+    #    as given. Only compute T_spatial when we actually need it.
+    if auto_mu:
+        T_spatial = 0.0
+        for i, pi_i in enumerate(pi):
+            V_i = V_spatial[i]
+            V_ip = V_spatial[i + 1]
+            a_marg = np.asarray(pi_i.sum(axis=1)).ravel()
+            b_marg = np.asarray(pi_i.sum(axis=0)).ravel()
+            cross = pi_i.dot(V_ip) if sp.issparse(pi_i) else pi_i @ V_ip
+            T_spatial += (
+                float(np.sum(a_marg[:, None] * (V_i * V_i)))
+                + float(np.sum(b_marg[:, None] * (V_ip * V_ip)))
+                - 2.0 * float(np.sum(V_i * cross))
+            )
+
+        D_spatial = data_term(V)
+        mu_used = target_temporal_ratio * D_spatial / max(T_spatial, 1e-30)
+    else:
+        mu_used = mu
+
+    if verbose:
+        print(f"mu used = {mu_used:.6e}" + (" (auto)" if auto_mu else " (fixed)"))
+
+    # 6) Joint solve once with fixed pi.
+    diag_blocks = [blk.copy() for blk in base_diag_blocks]
+    off_diag_blocks = []
+
+    for i, pi_i in enumerate(pi):
+        a_marg = np.asarray(pi_i.sum(axis=1)).ravel()
+        b_marg = np.asarray(pi_i.sum(axis=0)).ravel()
+
+        diag_blocks[i] = (
+            diag_blocks[i] + mu_used * sp.diags(a_marg, format="csr")
+        )
+        diag_blocks[i + 1] = (
+            diag_blocks[i + 1] + mu_used * sp.diags(b_marg, format="csr")
+        )
+
+        off_diag_blocks.append((i, i + 1, -mu_used * pi_i))
+        off_diag_blocks.append((i + 1, i, -mu_used * pi_i.T))
+
+    L = assemble_blocks(diag_blocks, offdiag_blocks=off_diag_blocks).tocsr()
+
+    V = solve_V_universal(
+        X, B, L,
+        niter_max=niter_max, tol=tol, eta=eta,
+        verbose=verbose, V0=V, step_rate=step_rate,
+        random_state=random_state,
+    ).astype(dtype, copy=False)
+
+    V_out = [
+        V[n_spots[i]:n_spots[i + 1], :]
+        for i in range(n_times)
+    ]
+
+    if return_ratio or verbose:
+        spatial = float(np.sum((L_base @ V) * V))
+        total_pen = float(np.sum((L @ V) * V))
+        temporal = total_pen - spatial
+        data = data_term(V)
+
+        if verbose:
+            print(f"final spatial/data ratio  = {spatial / data:.6e}")
+            print(f"final temporal/data ratio = {temporal / data:.6e}")
+
+        if return_ratio:
+            return V_out, pi, L, data, spatial / data, temporal / data
+
+    return V_out, pi, L
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Threshold-based tuning: lam and mu, as two separate steps
+# ─────────────────────────────────────────────────────────────────────────────
+def _total_data_variance(adata_group, pd_B):
+    """Total sum of squares of X around gene-wise means, using the same genes as ATLIS."""
+    adata = ad.concat(adata_group, axis=0, join="outer")
+    common = adata.var_names.intersection(pd_B.columns)
+    X = adata[:, common].X
+ 
+    n = X.shape[0]
+ 
+    if sp.issparse(X):
+        X = X.tocsr()
+        sum_sq = float(X.multiply(X).sum())
+        gene_sum = np.asarray(X.sum(axis=0)).ravel()
+    else:
+        X = np.asarray(X)
+        sum_sq = float(np.sum(X * X))
+        gene_sum = np.sum(X, axis=0)
+ 
+    tss = sum_sq - float(np.sum(gene_sum * gene_sum)) / n
+    return max(tss, 1e-30)
+ 
+ 
+def tune_lam(
+    adata_group, pd_B,
+    lam_grid=None, target_spatial_ratio=0.01,
+    time=None, outer_max=5, niter_max=1e3, tol=1e-5, eta=1e-3,
+    k=10, init="per_slice", V_init=None, ot_solver="low_rank",
+    one_step=True, step_rate="automatic", alpha=0.5, dtype=np.float32,
+    sparsify=False, random_state=0, verbose=True,
+):
+    """Tune lam alone, with mu=-1 so no OT coupling is built.
+ 
+    Increases lam along `lam_grid` and, at each step, checks the *achieved*
+    spatial/data ratio (spatial_ratio, i.e. tr(V^T L V) / D(V) at the actual
+    solution for that lam -- not an estimate). Since spatial_ratio increases
+    with lam, the sweep stops as soon as it reaches or passes
+    `target_spatial_ratio`, then picks whichever of the two neighboring grid
+    points -- the last one still below the target, or the first one at/above
+    it -- has an achieved ratio *closest* to target_spatial_ratio (not simply
+    the first one that clears it).
+ 
+    spatial_ratio is scale-free, so the same target_spatial_ratio is
+    comparable across datasets even when their natural lam scales differ
+    enormously. `_total_data_variance` is still computed and printed for
+    diagnostic purposes, but doesn't gate the stopping rule.
+ 
+    If lam_grid is exhausted without ever reaching target_spatial_ratio, a
+    warning is printed and the largest grid value is returned (it's the
+    closest available, since the ratio never got there) -- extend lam_grid
+    upward and rerun if you want a point nearer the target.
+    """
+    if lam_grid is None:
+        lam_grid = [0.0, 1e0, 3e0, 1e1, 3e1, 1e2, 3e2, 1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6]
+    lam_grid = sorted(lam_grid)
+ 
+    common_kwargs = dict(
+        time=time, outer_max=outer_max, niter_max=niter_max, tol=tol, eta=eta,
+        k=k, init=init, ot_solver=ot_solver, one_step=one_step,
+        step_rate=step_rate, alpha=alpha, dtype=dtype, sparsify=sparsify,
+        random_state=random_state,
+    )
+ 
+    total_var = _total_data_variance(adata_group, pd_B)
+ 
+    if verbose:
+        print(f"=== tune_lam: sweeping lam with mu=-1, target spatial_ratio={target_spatial_ratio:g} ===")
+        print(f"total data variance = {total_var:.6e}")
+ 
+    trace = []
+    prev = None   # (lam, V, ratio) of the last point evaluated
+    lam_star, V_star = lam_grid[-1], None
+    reached = False
+ 
+    for lam_val in lam_grid:
+        V_out, _, _, D, s_ratio, _ = solve_V_all_slices(
+            adata_group, pd_B, lam=lam_val, mu=-1,
+            V_init=V_init, return_ratio=True, verbose=False, **common_kwargs,
+        )
+        trace.append((lam_val, D, s_ratio))
+ 
+        if verbose:
+            print(f"  lam={lam_val:<10g} D={D:.6e}  spatial_ratio={s_ratio:.6e}")
+ 
+        if s_ratio >= target_spatial_ratio:
+            if prev is not None and abs(prev[2] - target_spatial_ratio) <= abs(s_ratio - target_spatial_ratio):
+                lam_star, V_star = prev[0], prev[1]
+            else:
+                lam_star, V_star = lam_val, V_out
+            reached = True
+            if verbose:
+                print(
+                    f"  -> crossed target_spatial_ratio={target_spatial_ratio:g} "
+                    f"between lam={prev[0] if prev else lam_val:g} and lam={lam_val:g}; "
+                    f"closest is lam={lam_star:g}"
+                )
+            break
+ 
+        prev = (lam_val, V_out, s_ratio)
+ 
+    if not reached:
+        lam_star, V_star = prev[0], prev[1]
+        if verbose:
+            print(
+                "  -> reached the end of lam_grid without hitting target_spatial_ratio; "
+                "consider extending lam_grid upward."
+            )
+ 
+    if verbose:
+        print(f"tune_lam chosen lam* = {lam_star}\n")
+ 
+    return lam_star, V_star, trace
+ 
+ 
+def tune_mu(
+    adata_group, pd_B, lam,
+    mu_grid=None, target_temporal_ratio=0.01,
+    time=None, outer_max=5, niter_max=1e3, tol=1e-5, eta=1e-3,
+    k=10, init="per_slice", V_init=None, ot_solver="low_rank",
+    one_step=True, step_rate="automatic", alpha=0.5, dtype=np.float32,
+    sparsify=False, random_state=0, verbose=True,
+):
+    """Tune mu at fixed lam, computing the OT coupling exactly once.
+ 
+    Solves once at (lam, mu=0) with the coupling actually built -- this is
+    the one OT solve, reused (via `coupling=pi_fixed`) for every candidate mu
+    below, so no further OT solves happen during the sweep. Increases mu
+    along `mu_grid` and, at each step, checks the achieved temporal/data
+    ratio (temporal_ratio, at the actual solution for that mu). Since
+    temporal_ratio increases with mu, the sweep stops as soon as it reaches
+    or passes `target_temporal_ratio`, then picks whichever of the two
+    neighboring grid points has an achieved ratio *closest* to
+    target_temporal_ratio (not simply the first one that clears it), and
+    returns the full solve already computed for that point (no re-solve
+    needed).
+ 
+    If mu_grid is exhausted without ever reaching target_temporal_ratio, a
+    warning is printed and the largest grid value's result is returned (it's
+    the closest available) -- extend mu_grid upward and rerun if you want a
+    point nearer the target.
+    """
+    if mu_grid is None:
+        mu_grid = [0.0, 1e0, 3e0, 1e1, 3e1, 1e2, 3e2, 1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6]
+    mu_grid = sorted(mu_grid)
+ 
+    common_kwargs = dict(
+        time=time, outer_max=outer_max, niter_max=niter_max, tol=tol, eta=eta,
+        k=k, init=init, ot_solver=ot_solver, one_step=one_step,
+        step_rate=step_rate, alpha=alpha, dtype=dtype, sparsify=sparsify,
+        random_state=random_state,
+    )
+ 
+    total_var = _total_data_variance(adata_group, pd_B)
+ 
+    if verbose:
+        print(f"=== tune_mu: one OT solve at lam={lam:g}, target temporal_ratio={target_temporal_ratio:g} ===")
+        print(f"total data variance = {total_var:.6e}")
+ 
+    # The one OT solve. mu=0.0 here only fixes the point the coupling is
+    # built from -- it doesn't imply mu stays 0 for the rest of the sweep.
+    V_spatial, pi_fixed, L0, D0, s0, t0 = solve_V_all_slices(
+        adata_group, pd_B, lam=lam, mu=0.0,
+        V_init=V_init, #compute_coupling=True,
+        return_ratio=True, verbose=False, **common_kwargs,
+    )
+ 
+    trace = [(0.0, D0, t0)]
+    if verbose:
+        print(f"  mu={0.0:<10g} D={D0:.6e}  temporal_ratio={t0:.6e}")
+ 
+    prev = (0.0, (V_spatial, pi_fixed, L0, D0, s0, t0), t0)
+    mu_star, result_star = prev[0], prev[1]
+    reached = False
+ 
+    for mu_val in mu_grid:
+        if mu_val == 0.0:
+            continue
+ 
+        V_out, pi_out, L_out, D, s_out, t_out = solve_V_all_slices(
+            adata_group, pd_B, lam=lam, mu=mu_val,
+            V_init=V_spatial, coupling=pi_fixed,
+            return_ratio=True, verbose=False, **common_kwargs,
+        )
+        result = (V_out, pi_out, L_out, D, s_out, t_out)
+        trace.append((mu_val, D, t_out))
+ 
+        if verbose:
+            print(f"  mu={mu_val:<10g} D={D:.6e}  temporal_ratio={t_out:.6e}")
+ 
+        if t_out >= target_temporal_ratio:
+            if abs(prev[2] - target_temporal_ratio) <= abs(t_out - target_temporal_ratio):
+                mu_star, result_star = prev[0], prev[1]
+            else:
+                mu_star, result_star = mu_val, result
+            reached = True
+            if verbose:
+                print(
+                    f"  -> crossed target_temporal_ratio={target_temporal_ratio:g} "
+                    f"between mu={prev[0]:g} and mu={mu_val:g}; closest is mu={mu_star:g}"
+                )
+            break
+ 
+        prev = (mu_val, result, t_out)
+ 
+    if not reached:
+        mu_star, result_star = prev[0], prev[1]
+        if verbose:
+            print(
+                "  -> reached the end of mu_grid without hitting target_temporal_ratio; "
+                "consider extending mu_grid upward."
+            )
+ 
+    if verbose:
+        print(f"tune_mu chosen mu* = {mu_star}\n")
+ 
+    return mu_star, result_star, trace
+
+
+def solve_V_all_slices_iterate(
+    adata_group, pd_B,
+    lam=None, mu=None, time=None,
+    outer_max=5, niter_max=1e3, tol=1e-5, eta=1e-3,
+    verbose=True, coupling=None, k=10, init="per_slice",
+    V_init=None, ot_solver="fgw", one_step=True,
+    step_rate="automatic", alpha=0.5,
+    dtype=np.float32,
+    sparsify=False,
+    random_state=0,
+    return_ratio=False,
+    target_spatial_ratio=0.01,
+    target_temporal_ratio=0.01,
+):
+    """Learn cell-type program scores jointly across ordered slices.
+
+    This keeps the original, unnormalized objective
+
+        D(V) + lam * S(V) + mu * T(V; pi)
+
+    and the original coupling construction.
+
+    lam and mu are each INDEPENDENTLY either:
+      - None: auto-computed once so that the corresponding regularizer is
+        approximately `target_spatial_ratio` / `target_temporal_ratio` of the
+        data-fitting term at the state where it is introduced, or
+      - a fixed numeric value: used directly, no calibration.
+
+    So you can mix and match, e.g. lam=0.3 (fixed) with mu=None (ratio-based),
+    or vice versa, or both fixed, or both auto (the default, lam=None, mu=None).
+
+    mu=-1 remains a special sentinel meaning "spatial-only, skip OT/temporal
+    entirely" (unchanged from before).
+
+    one_step=False alternates (recompute pi from the current V -> re-solve V)
+    for up to `outer_max` total outer iterations, stopping early when the
+    relative change in V falls below `tol`. lam and mu stay fixed. Ignored
+    when `coupling` is supplied.
+
+    Returns (V_per_slice, pi_list, L), with optional final realized
+    spatial/data and temporal/data ratios when ``return_ratio=True``.
+    """
+    auto_lam = lam is None
+    auto_mu = mu is None
+
+    rng = np.random.default_rng(random_state)
+    n_times = len(adata_group)
+
+    n_spots = [0]
+    for a_i in adata_group:
+        n_spots.append(n_spots[-1] + a_i.shape[0])
+
+    adata = ad.concat(adata_group, axis=0, join="outer")
+    common = adata.var_names.intersection(pd_B.columns)
+    adata_sub = adata[:, common].copy()
+    adata_group = [a_i[:, common].copy() for a_i in adata_group]
+    pd_B_sub = pd_B[common]
+
+    # Preserve the original time convention.
+    if time is None:
+        time = list(range(n_times))
+    if time[-1] == time[0]:
+        rescaled_time = [0.0] * len(time)
+    else:
+        span = time[-1] - time[0]
+        rescaled_time = [(t - time[0]) / span for t in time]
+
+    spatial_blocks = []
+    for a_i in adata_group:
+        Li, _ = laplacian_from_coords(
+            a_i.obs["x"].to_numpy(),
+            a_i.obs["y"].to_numpy(),
+            k=k, normed=True,
+        )
+        if not sp.issparse(Li):
+            Li = sp.csr_matrix(Li)
+        spatial_blocks.append(Li.tocsr())
+
+    B = np.asarray(pd_B_sub.to_numpy().T, dtype=dtype)
+
+    X = adata_sub.X.T
+    X = (
+        X.tocsr().astype(dtype) if sp.issparse(X)
+        else sp.csr_matrix(np.asarray(X, dtype=dtype))
+    )
+
+    G = X.T @ B
+    if sp.issparse(G):
+        G = G.toarray()
+    G = np.asarray(G, dtype=dtype)
+
+    H = (B.T @ B).astype(dtype, copy=False)
+    xnorm2 = float(X.multiply(X).sum())
+
+    def data_term(V):
+        return (
+            xnorm2
+            - 2.0 * float(np.sum(V * G))
+            + float(np.sum((V @ H) * V))
+        )
+
+    # 1) Unregularized reference V0 (also used as init for the spatial solve,
+    #    regardless of whether lam ends up auto or fixed).
+    if V_init is None:
+        V0_list = []
+        for i, Li in enumerate(spatial_blocks):
+            Xi = X[:, n_spots[i]:n_spots[i + 1]]
+            L0 = sp.csr_matrix(Li.shape, dtype=dtype)
+            V_i = np.asarray(
+                solve_V_universal(
+                    Xi, B, L0,
+                    niter_max=niter_max, tol=tol, eta=eta,
+                    verbose=False, step_rate=step_rate,
+                    random_state=random_state,
+                ),
+                dtype=dtype,
+            )
+            if init == "random":
+                V_i = rng.random(V_i.shape).astype(dtype)
+                V_i = V_i / (V_i.sum(axis=1, keepdims=True) + 1e-15)
+            V0_list.append(V_i)
+    else:
+        V0_list = [np.asarray(V_i, dtype=dtype) for V_i in V_init]
+
+    V0 = np.vstack(V0_list).astype(dtype, copy=False)
+
+    # 2) Choose lambda: auto from the unregularized strengths, or use as given.
+    if auto_lam:
+        D0 = data_term(V0)
+        L_spatial_raw = assemble_blocks([blk.copy() for blk in spatial_blocks]).tocsr()
+        S0 = float(np.sum((L_spatial_raw @ V0) * V0))
+        lam_used = target_spatial_ratio * D0 / max(S0, 1e-30)
+    else:
+        lam_used = lam
+
+    if verbose:
+        print(f"lambda used = {lam_used:.6e}" + (" (auto)" if auto_lam else " (fixed)"))
+
+    # 3) Spatial-only solve with the chosen lambda.
+    base_diag_blocks = [(lam_used * Li).tocsr() for Li in spatial_blocks]
+    L_base = assemble_blocks([blk.copy() for blk in base_diag_blocks]).tocsr()
+
+    V_spatial = []
+    for i, Li_scaled in enumerate(base_diag_blocks):
+        Xi = X[:, n_spots[i]:n_spots[i + 1]]
+        V_i = np.asarray(
+            solve_V_universal(
+                Xi, B, Li_scaled,
+                niter_max=niter_max, tol=tol, eta=eta,
+                verbose=False, V0=V0_list[i], step_rate=step_rate,
+                random_state=random_state,
+            ),
+            dtype=dtype,
+        )
+        V_spatial.append(V_i)
+
+    V = np.vstack(V_spatial).astype(dtype, copy=False)
+
+    # Special case: mu = -1 means spatial-only; skip OT coupling entirely.
+    if mu == -1:
+        if verbose:
+            print("mu = -1: skipping OT coupling and temporal regularization.")
+
+        pi = [None] * (n_times - 1)
+        L = L_base
+
+        V_out = [
+            V[n_spots[i]:n_spots[i + 1], :]
+            for i in range(n_times)
+        ]
+
+        if return_ratio or verbose:
+            spatial = float(np.sum((L_base @ V) * V))
+            data = data_term(V)
+
+            if verbose:
+                print(f"final spatial/data ratio  = {spatial / data:.6e}")
+                print("final temporal/data ratio = 0.000000e+00")
+
+            if return_ratio:
+                return V_out, pi, L, data, spatial / data, 0.0
+
+        return V_out, pi, L
+
+    # 4) Compute the actual OT coupling ONCE from the spatially regularized V.
+    pi = [None] * (n_times - 1)
+
+    for i in range(n_times - 1):
+        n_i, n_ip = adata_group[i].n_obs, adata_group[i + 1].n_obs
+        a = np.full(n_i, 1.0 / n_i, dtype=dtype)
+        b = np.full(n_ip, 1.0 / n_ip, dtype=dtype)
+
+        if coupling is None:
+            C = scipy.spatial.distance.cdist(
+                V_spatial[i].astype(np.float64, copy=False),
+                V_spatial[i + 1].astype(np.float64, copy=False),
+                metric="sqeuclidean",
+            )
+            C = C / (C.max() + 1e-15)
+            pi_i = _compute_coupling(
+                ot_solver, C,
+                adata_group[i], adata_group[i + 1],
+                V_spatial[i], V_spatial[i + 1],
+                a, b, alpha, verbose,
+            )
+        else:
+            pi_raw = coupling[i]
+            if sp.issparse(pi_raw):
+                pi_i = pi_raw.tocsr().astype(dtype, copy=False)
+            else:
+                pi_i = np.asarray(pi_raw, dtype=dtype)
+
+        if sparsify:
+            pi_i = sparsify_pi_sparse(
+                pi_i, k_row=max(1, int(k / 4)), k_col=max(1, int(k / 4))
+            )
+
+        # Preserve the original coupling scaling.
+        pi_i = pi_i / (pi_i.sum() + 1e-15)
+        pi_i = pi_i * np.sqrt(pi_i.shape[0] * pi_i.shape[1])
+
+        dt = rescaled_time[i + 1] - rescaled_time[i]
+        if dt != 0:
+            pi_i = pi_i / dt
+
+        pi[i] = pi_i
+
+    # 5) Choose mu: auto from the bare temporal quadratic at V_spatial, or use
+    #    as given. Only compute T_spatial when we actually need it.
+    if auto_mu:
+        T_spatial = 0.0
+        for i, pi_i in enumerate(pi):
+            V_i = V_spatial[i]
+            V_ip = V_spatial[i + 1]
+            a_marg = np.asarray(pi_i.sum(axis=1)).ravel()
+            b_marg = np.asarray(pi_i.sum(axis=0)).ravel()
+            cross = pi_i.dot(V_ip) if sp.issparse(pi_i) else pi_i @ V_ip
+            T_spatial += (
+                float(np.sum(a_marg[:, None] * (V_i * V_i)))
+                + float(np.sum(b_marg[:, None] * (V_ip * V_ip)))
+                - 2.0 * float(np.sum(V_i * cross))
+            )
+
+        D_spatial = data_term(V)
+        mu_used = target_temporal_ratio * D_spatial / max(T_spatial, 1e-30)
+    else:
+        mu_used = mu
+
+    if verbose:
+        print(f"mu used = {mu_used:.6e}" + (" (auto)" if auto_mu else " (fixed)"))
+
+    # 6) Joint solve once with fixed pi.
+    diag_blocks = [blk.copy() for blk in base_diag_blocks]
+    off_diag_blocks = []
+
+    for i, pi_i in enumerate(pi):
+        a_marg = np.asarray(pi_i.sum(axis=1)).ravel()
+        b_marg = np.asarray(pi_i.sum(axis=0)).ravel()
+
+        diag_blocks[i] = (
+            diag_blocks[i] + mu_used * sp.diags(a_marg, format="csr")
+        )
+        diag_blocks[i + 1] = (
+            diag_blocks[i + 1] + mu_used * sp.diags(b_marg, format="csr")
+        )
+
+        off_diag_blocks.append((i, i + 1, -mu_used * pi_i))
+        off_diag_blocks.append((i + 1, i, -mu_used * pi_i.T))
+
+    L = assemble_blocks(diag_blocks, offdiag_blocks=off_diag_blocks).tocsr()
+
+    V = solve_V_universal(
+        X, B, L,
+        niter_max=niter_max, tol=tol, eta=eta,
+        verbose=verbose, V0=V, step_rate=step_rate,
+        random_state=random_state,
+    ).astype(dtype, copy=False)
+
+    # 7) Optional alternating refinement: recompute pi from the current V,
+    #    then re-solve V with the new pi.
+    if not one_step and coupling is None:
+        for outer in range(1, int(outer_max)):
+            V_cur = [
+                V[n_spots[i]:n_spots[i + 1], :]
+                for i in range(n_times)
+            ]
+
+            pi = [None] * (n_times - 1)
+            for i in range(n_times - 1):
+                n_i, n_ip = adata_group[i].n_obs, adata_group[i + 1].n_obs
+                a = np.full(n_i, 1.0 / n_i, dtype=dtype)
+                b = np.full(n_ip, 1.0 / n_ip, dtype=dtype)
+
                 C = scipy.spatial.distance.cdist(
-                    V_init[i].astype(np.float64, copy=False),
-                    V_init[i + 1].astype(np.float64, copy=False),
+                    V_cur[i].astype(np.float64, copy=False),
+                    V_cur[i + 1].astype(np.float64, copy=False),
                     metric="sqeuclidean",
                 )
                 C = C / (C.max() + 1e-15)
                 pi_i = _compute_coupling(
                     ot_solver, C,
                     adata_group[i], adata_group[i + 1],
-                    V_init[i], V_init[i + 1],
+                    V_cur[i], V_cur[i + 1],
                     a, b, alpha, verbose,
                 )
-            else:
-                pi_i = np.asarray(coupling[i], dtype=dtype)
 
-            if sparsify:
-                pi_i = sparsify_pi_sparse(pi_i, k_row=int(k / 4), k_col=int(k / 4))
-            pi_i = pi_i / (pi_i.sum() + 1e-15)
-            pi_i = pi_i * np.sqrt(pi_i.shape[0] * pi_i.shape[1])
+                if sparsify:
+                    pi_i = sparsify_pi_sparse(
+                        pi_i, k_row=max(1, int(k / 4)), k_col=max(1, int(k / 4))
+                    )
 
-            dt = rescaled_time[i + 1] - rescaled_time[i]
-            if dt != 0:
-                pi_i = pi_i / dt
-            pi[i] = pi_i
+                pi_i = pi_i / (pi_i.sum() + 1e-15)
+                pi_i = pi_i * np.sqrt(pi_i.shape[0] * pi_i.shape[1])
 
-            a_marg = np.asarray(pi_i.sum(axis=1)).ravel()
-            b_marg = np.asarray(pi_i.sum(axis=0)).ravel()
+                dt = rescaled_time[i + 1] - rescaled_time[i]
+                if dt != 0:
+                    pi_i = pi_i / dt
 
-            diag_blocks[i] = diag_blocks[i] + mu * sp.diags(a_marg, format="csr")
-            diag_blocks[i + 1] = diag_blocks[i + 1] + mu * sp.diags(b_marg, format="csr")
+                pi[i] = pi_i
 
-            off_diag_blocks.append((i, i + 1, -mu * pi_i))
-            off_diag_blocks.append((i + 1, i, -mu * pi_i.T))
+            diag_blocks = [blk.copy() for blk in base_diag_blocks]
+            off_diag_blocks = []
 
-        L = assemble_blocks(diag_blocks, offdiag_blocks=off_diag_blocks).tocsr()
+            for i, pi_i in enumerate(pi):
+                a_marg = np.asarray(pi_i.sum(axis=1)).ravel()
+                b_marg = np.asarray(pi_i.sum(axis=0)).ravel()
 
-        if mu >= 0:
-            V = solve_V_universal(
+                diag_blocks[i] = (
+                    diag_blocks[i] + mu_used * sp.diags(a_marg, format="csr")
+                )
+                diag_blocks[i + 1] = (
+                    diag_blocks[i + 1] + mu_used * sp.diags(b_marg, format="csr")
+                )
+
+                off_diag_blocks.append((i, i + 1, -mu_used * pi_i))
+                off_diag_blocks.append((i + 1, i, -mu_used * pi_i.T))
+
+            L = assemble_blocks(diag_blocks, offdiag_blocks=off_diag_blocks).tocsr()
+
+            V_new = solve_V_universal(
                 X, B, L,
                 niter_max=niter_max, tol=tol, eta=eta,
-                verbose=verbose, V0=V, step_rate=step_rate,
+                verbose=False, V0=V, step_rate=step_rate,
+                random_state=random_state,
             ).astype(dtype, copy=False)
 
-            for i in range(n_times):
-                V_init[i] = V[n_spots[i]:n_spots[i + 1], :]
+            rel_change = float(
+                np.linalg.norm(V_new - V) / max(np.linalg.norm(V), 1e-30)
+            )
+            V = V_new
 
-        f_curr = objective(V, L)
-        rel_drop = (f_prev - f_curr) / max(1.0, abs(f_prev))
-
-        if verbose and (iter_outer % 50 == 0 or rel_drop < tol):
-            print(f"iter {iter_outer:4d}  f={f_curr:.6e}  rel_drop={rel_drop:.3e}")
-
-        if f_curr <= f_prev and rel_drop < tol:
             if verbose:
-                print("stopped after iteration #", iter_outer)
-            break
+                print(
+                    f"outer iter {outer + 1}/{int(outer_max)}: "
+                    f"relative change in V = {rel_change:.3e}"
+                )
 
-        f_prev = f_curr
+            if rel_change < tol:
+                break
 
-    return V_init, pi, L
+    V_out = [
+        V[n_spots[i]:n_spots[i + 1], :]
+        for i in range(n_times)
+    ]
 
+    if return_ratio or verbose:
+        spatial = float(np.sum((L_base @ V) * V))
+        total_pen = float(np.sum((L @ V) * V))
+        temporal = total_pen - spatial
+        data = data_term(V)
+
+        if verbose:
+            print(f"final spatial/data ratio  = {spatial / data:.6e}")
+            print(f"final temporal/data ratio = {temporal / data:.6e}")
+
+        if return_ratio:
+            return V_out, pi, L, data, spatial / data, temporal / data
+
+    return V_out, pi, L

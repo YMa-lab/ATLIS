@@ -17,8 +17,8 @@ from sklearn.decomposition import PCA
 
 def _build_graph(V, n_neighbors=15, random_state=0):
     tmp = ad.AnnData(X=np.asarray(V))
-    sc.pp.neighbors(tmp, n_neighbors=n_neighbors, use_rep=None,
-                    random_state=random_state)
+    sc.pp.neighbors(tmp, n_neighbors=n_neighbors, #use_rep=None,
+                    random_state=random_state, use_rep='X')
     return tmp
 
 
@@ -140,6 +140,20 @@ def _find_resolution_for_target_clusters(
 
     return best_labels, best_res, best_n_clust
 
+
+def _order_by_size(labels, names=None):
+    """Relabel so 0 = largest group, 1 = next largest, etc.
+    Returns (new_labels, new_names). new_names is None if names is None."""
+    labels = np.asarray(labels)
+    vals, counts = np.unique(labels, return_counts=True)
+    order = vals[np.argsort(-counts, kind="stable")]
+    remap = np.full(vals.max() + 1, -1, dtype=int)
+    remap[order] = np.arange(len(order))
+    new_labels = remap[labels]
+    new_names = None if names is None else [names[v] for v in order]
+    return new_labels, new_names
+
+
 def cluster_compute_ari_and_plot(
     V,
     adata,
@@ -148,18 +162,24 @@ def cluster_compute_ari_and_plot(
     clustering="louvain",
     n_clusters=None,
     n_neighbors=15,
-    resolution=1.0,                 # <--- default fixed resolution
-    auto_resolution=False,          
+    resolution=1.0,
+    auto_resolution=False,
     resolution_grid=None,
     random_state=0,
     figsize=(12, 5),
     plot=True,
+    sort_by_size=True,
 ):
     V = np.asarray(V)
+
+    cats = adata.obs[celltype_key].astype("category").cat.categories.tolist()
     true_labels = adata.obs[celltype_key].astype("category").cat.codes.to_numpy()
 
     if V.shape[0] != len(true_labels):
         raise ValueError("Row count in V must match number of cells in adata.")
+
+    if sort_by_size:
+        true_labels, cats = _order_by_size(true_labels, cats)
 
     clustering = clustering.lower()
 
@@ -201,7 +221,6 @@ def cluster_compute_ari_and_plot(
             print(f"{method.capitalize()}: target_k={target_k}, "
                       f"best_resolution={best_res:.3f}, n_clusters={n_clust}")
 
-
         # -------- FIXED RESOLUTION (DEFAULT) --------
         else:
             tmp = _build_graph(V, n_neighbors=n_neighbors, random_state=random_state)
@@ -209,7 +228,6 @@ def cluster_compute_ari_and_plot(
             pred_labels, n_clust = _cluster_at_resolution(
                 tmp,
                 method=method,
-                # n_neighbors=n_neighbors,
                 resolution=resolution,
                 random_state=random_state,
             )
@@ -219,6 +237,9 @@ def cluster_compute_ari_and_plot(
 
     else:
         raise ValueError(f"Unknown clustering method: {clustering}")
+
+    if sort_by_size:
+        pred_labels, _ = _order_by_size(pred_labels)
 
     # ------------------------------------------------------------------
     # Metrics
@@ -233,18 +254,20 @@ def cluster_compute_ari_and_plot(
         emb = adata.obsm[embedding_key]
         x, y = emb[:, 0], emb[:, 1]
 
+        vmax = max(int(true_labels.max()), int(pred_labels.max()))
+
         fig, axes = plt.subplots(1, 2, figsize=figsize)
 
-        axes[0].scatter(x, y, c=true_labels, cmap="tab20c", s=8)
+        axes[0].scatter(x, y, c=true_labels, cmap="tab20c", s=8, vmin=0, vmax=vmax)
         axes[0].set_title("True labels\n" + celltype_key)
 
-        axes[1].scatter(x, y, c=pred_labels, cmap="tab20c", s=8)
+        axes[1].scatter(x, y, c=pred_labels, cmap="tab20c", s=8, vmin=0, vmax=vmax)
         axes[1].set_title(f"{clustering.capitalize()} clusters\n(ARI = {ari:.3f})")
 
         plt.tight_layout()
         plt.show()
 
-    return ari, nmi, true_labels, pred_labels
+    return ari, nmi, true_labels, pred_labels#, cats
 
 # Part 2: Optimal transport-based metrics. Retrieved from DeST-OT GitHub.
 

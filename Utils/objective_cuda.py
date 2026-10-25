@@ -86,6 +86,11 @@ def csr_diagonal(A, n, device):
     return out
 
 
+def csr_trace(A, device):
+    """Trace of a torch sparse CSR matrix as a Python float."""
+    return float(csr_diagonal(A, A.shape[0], device).sum())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Coupling sparsification
 # ─────────────────────────────────────────────────────────────────────────────
@@ -412,11 +417,18 @@ def _coords_of(adata_slice, device, dtype):
 def solve_V_per_slice_torch(
     adata, pd_B, lam=10, k=20, niter_max=1e3, tol=1e-5, eta=1e-3,
     verbose=True, return_obj=False, proj_simplex=False, step_rate="backtrack",
-    L=None, device=None, dtype=torch.float32,
+    L=None, device=None, dtype=torch.float32, normalize_terms=True,
 ):
-    """Deconvolve a single slice with only its own spatial Laplacian.
+    """Deconvolve one slice with spatial regularization.
 
-    Pass `L` to reuse an already-scaled Laplacian instead of rebuilding it.
+    With ``normalize_terms=True``, the optimized objective is proportional to
+
+        ||X - B V^T||_F^2 / (n_spots * n_genes)
+        + lam * tr(V^T L V) / tr(L).
+
+    ``L``, when supplied, is the raw (unscaled) spatial Laplacian. The solver
+    keeps an unnormalized data term, so L is internally rescaled by
+    (n_spots * n_genes) / tr(L), which gives the same minimizer.
     """
     device = get_device(device)
 
@@ -428,13 +440,19 @@ def solve_V_per_slice_torch(
             _coords_of(adata_sub, device, dtype),
             k=k, normed=True, device=device, dtype=dtype,
         )
-        L = scale_csr(L, lam, device)
 
     B = torch.as_tensor(pd_B[common].to_numpy().T, dtype=dtype, device=device)
     X = _X_to_torch_csr(adata_sub, device, dtype)
 
+    if normalize_terms:
+        data_scale = float(X.shape[0] * X.shape[1])
+        lam_eff = lam * data_scale / max(csr_trace(L, device), 1e-15)
+    else:
+        lam_eff = lam
+    L_scaled = scale_csr(L, lam_eff, device)
+
     return solve_V_universal_torch(
-        X, B, L,
+        X, B, L_scaled,
         niter_max=niter_max, tol=tol, eta=eta, verbose=verbose,
         return_obj=return_obj, proj_simplex=proj_simplex, step_rate=step_rate,
         device=device, dtype=dtype,
@@ -545,64 +563,90 @@ def solve_V_all_slices_torch(
     step_rate="automatic", alpha=0.9,
     dtype=torch.float32, device=None,
     k_graph=None, return_numpy=True,
+    normalize_terms=True, return_ratio=False,
 ):
     """Deconvolve all slices jointly, coupling consecutive time points via OT.
 
-    Alternates between (i) computing couplings pi_t between adjacent slices and
-    (ii) solving for V under a block Laplacian that combines each slice's
-    spatial graph with the coupling-induced cross-slice penalty, weighted by mu.
-    `mu < 0` skips the V update entirely and only returns the couplings.
+    With ``normalize_terms=True``, the objective is proportional to
 
-    V and the couplings are dense by design; the couplings are pruned after
-    solving, but the OT solvers still build dense cost matrices.
+        data / (N G) + lam * spatial / tr(L_spatial)
+                     + mu  * temporal / tr(L_temporal),
 
-    `k_graph` sets the spatial kNN degree separately from `k`, which drives the
-    coupling sparsification via int(k/4). `return_numpy` converts the results
-    back to numpy / scipy on the way out.
+    where each temporal coupling has unit total mass before the existing 1/dt
+    weighting. The implementation keeps the data term unnormalized and uses
+    effective coefficients in the block Laplacian, which gives the same
+    minimizer. Setting ``normalize_terms=False`` restores the legacy scaling,
+    including sqrt(n_t n_{t+1}) rescaling of each coupling.
 
-    Returns (V_per_slice, pi_list, L).
+    If ``return_ratio=True``, also return the realized weighted spatial/data
+    and temporal/data penalty ratios at the final iterate.
     """
     device = get_device(device)
     if k_graph is None:
         k_graph = k
 
     n_times = len(adata_group)
-
     n_spots = [0]
     for a_i in adata_group:
         n_spots.append(n_spots[-1] + a_i.shape[0])
 
     adata = ad.concat(adata_group, axis=0, join="outer")
     common = adata.var_names.intersection(pd_B.columns)
-
     adata_sub = adata[:, common].copy()
     adata_group = [a_i[:, common].copy() for a_i in adata_group]
     pd_B_sub = pd_B[common]
 
     if time is None:
-        time = list(range(n_times))
-    if time[-1] == time[0]:
-        rescaled_time = [0.0] * len(time)
+        rescaled_time = list(range(n_times))
     else:
-        span = time[-1] - time[0]
-        rescaled_time = [(t - time[0]) / span for t in time]
+        time = np.asarray(time, dtype=float)
+        if time[-1] == time[0]:
+            rescaled_time = np.zeros(n_times)
+        else:
+            # preserve relative time intervals, but make the average interval 1
+            dt_mean = np.mean(np.diff(time))
+            rescaled_time = (time - time[0]) / dt_mean
 
-    # Coords stay on device, reused for the spatial graphs and the GW costs.
+    # Raw spatial Laplacians. Scaling is applied below after computing the
+    # natural aggregate scale tr(L_spatial).
     coords = [_coords_of(a_i, device, dtype) for a_i in adata_group]
-
-    base_diag_blocks = []
+    spatial_blocks = []
     for c_i in coords:
         Li, _ = laplacian_from_coords_torch(
             c_i, k=k_graph, normed=True, device=device, dtype=dtype
         )
-        base_diag_blocks.append(scale_csr(Li, lam, device))
+        spatial_blocks.append(Li)
 
     B = torch.as_tensor(pd_B_sub.to_numpy().T, dtype=dtype, device=device)
     X = _X_to_torch_csr(adata_sub, device, dtype)
 
+    expr_scale = X.values().sum() / (X.shape[0] * X.shape[1])
+    expr_scale = torch.clamp(expr_scale, min=1e-15)
+
+    B = B / expr_scale
+    X = torch.sparse_csr_tensor(
+        X.crow_indices(),
+        X.col_indices(),
+        X.values() / expr_scale,
+        size=X.shape,
+        device=device,
+        dtype=dtype,
+    )
+
     G = torch.sparse.mm(X.t(), B)
     H = B.T @ B
     xnorm2 = (X.values() ** 2).sum()
+
+    # The inner solver uses the unnormalized data term. Multiplying the desired
+    # normalized objective by N*G therefore amounts to using these effective
+    # regularization coefficients.
+    data_scale = float(X.shape[0] * X.shape[1])
+    spatial_trace = sum(csr_trace(Li, device) for Li in spatial_blocks)
+    lam_eff = lam * data_scale / max(spatial_trace, 1e-15) if normalize_terms else lam
+    base_diag_blocks = [scale_csr(Li, lam_eff, device) for Li in spatial_blocks]
+
+    # Keep the weighted spatial operator separate for diagnostics.
+    L_base = assemble_blocks_torch(base_diag_blocks, device=device, dtype=dtype)
 
     def objective(V, L):
         data = xnorm2 - 2.0 * (V * G).sum() + ((V @ H) * V).sum()
@@ -610,11 +654,11 @@ def solve_V_all_slices_torch(
 
     if V_init is None:
         V_init = []
-        for a_i, L_i in zip(adata_group, base_diag_blocks):
+        for a_i, L_i in zip(adata_group, spatial_blocks):
             V_i = solve_V_per_slice_torch(
                 a_i, pd_B_sub, lam=lam, k=k_graph, eta=eta,
                 step_rate=step_rate, L=L_i, device=device,
-                dtype=dtype, verbose=verbose,
+                dtype=dtype, verbose=verbose, normalize_terms=normalize_terms,
             )
             if init == "random":
                 gen = torch.Generator(device="cpu").manual_seed(0)
@@ -638,6 +682,21 @@ def solve_V_all_slices_torch(
     f_prev = objective(V, L)
     pi = [None] * (n_times - 1)
 
+    # A unit-mass coupling contributes trace 2 to its pairwise temporal
+    # Laplacian. The existing 1/dt weighting multiplies that by 1/dt.
+    temporal_trace = 0.0
+    for i in range(n_times - 1):
+        dt = rescaled_time[i + 1] - rescaled_time[i]
+        temporal_trace += 2.0 / dt if dt != 0 else 2.0
+    mu_eff = mu * data_scale / max(temporal_trace, 1e-15) if normalize_terms else mu
+
+    if verbose:
+        print(f"effective lam={lam_eff:.6g}  effective mu={mu_eff:.6g}")
+
+    # Defined here so return_ratio also works when the final verbose condition
+    # is not triggered.
+    spatial = coupling_pen = data = float("nan")
+
     for iter_outer in range(outer_max):
         diag_blocks = list(base_diag_blocks)
         off_diag_blocks = []
@@ -651,23 +710,24 @@ def solve_V_all_slices_torch(
                 C = torch.cdist(V_init[i], V_init[i + 1]).pow_(2)
                 C = C / (C.max() + 1e-15)
                 pi_i = _compute_coupling(
-                    ot_solver, C,
-                    coords[i], coords[i + 1],
-                    V_init[i], V_init[i + 1],
-                    a, b, alpha, verbose, device, dtype,
+                    ot_solver, C, coords[i], coords[i + 1],
+                    V_init[i], V_init[i + 1], a, b,
+                    alpha, verbose, device, dtype,
                 )
                 del C
             else:
-                pi_i = torch.as_tensor(
-                    np.asarray(coupling[i]), dtype=dtype, device=device
-                )
+                pi_raw = coupling[i]
+                if sp.issparse(pi_raw):
+                    pi_raw = pi_raw.toarray()
+                pi_i = torch.as_tensor(np.asarray(pi_raw), dtype=dtype, device=device)
 
             # FRLC can return tiny negatives; sparsify rejects them.
             pi_i = pi_i.clamp_min(0.0)
-
             pi_i = sparsify_pi_torch(pi_i, k_row=int(k / 4), k_col=int(k / 4))
             pi_i = pi_i / (pi_i.sum() + 1e-15)
-            pi_i = pi_i * float(np.sqrt(pi_i.shape[0] * pi_i.shape[1]))
+            if not normalize_terms:
+                # Legacy scaling retained for exact backward compatibility.
+                pi_i = pi_i * float(np.sqrt(pi_i.shape[0] * pi_i.shape[1]))
 
             dt = rescaled_time[i + 1] - rescaled_time[i]
             if dt != 0:
@@ -678,14 +738,14 @@ def solve_V_all_slices_torch(
             b_marg = pi_i.sum(dim=0)
 
             diag_blocks[i] = add_csr(
-                diag_blocks[i], diag_csr(mu * a_marg, device)
+                diag_blocks[i], diag_csr(mu_eff * a_marg, device)
             )
             diag_blocks[i + 1] = add_csr(
-                diag_blocks[i + 1], diag_csr(mu * b_marg, device)
+                diag_blocks[i + 1], diag_csr(mu_eff * b_marg, device)
             )
 
-            off_diag_blocks.append((i, i + 1, -mu * pi_i))
-            off_diag_blocks.append((i + 1, i, -mu * pi_i.T))
+            off_diag_blocks.append((i, i + 1, -mu_eff * pi_i))
+            off_diag_blocks.append((i + 1, i, -mu_eff * pi_i.T))
 
         L = assemble_blocks_torch(
             diag_blocks, offdiag_blocks=off_diag_blocks, device=device, dtype=dtype
@@ -698,7 +758,6 @@ def solve_V_all_slices_torch(
                 verbose=verbose, V0=V, step_rate=step_rate,
                 device=device, dtype=dtype,
             )
-
             for i in range(n_times):
                 V_init[i] = V[n_spots[i]:n_spots[i + 1], :]
 
@@ -706,19 +765,37 @@ def solve_V_all_slices_torch(
         rel_drop = (f_prev - f_curr) / max(1.0, abs(f_prev))
 
         if verbose and (iter_outer % 50 == 0 or rel_drop < tol):
+            spatial = float(((L_base @ V) * V).sum())
+            coupling_pen = float(((L @ V) * V).sum()) - spatial
+            data = f_curr - spatial - coupling_pen
             print(f"iter {iter_outer:4d}  f={f_curr:.6e}  rel_drop={rel_drop:.3e}")
+            print(f"data={data:.4e}  spatial={spatial:.4e} ({spatial / data:.2%})  "
+                  f"coupling={coupling_pen:.4e} ({coupling_pen / data:.2%})")
 
         if f_curr <= f_prev and rel_drop < tol:
             if verbose:
                 print("stopped after iteration #", iter_outer)
             break
-
         f_prev = f_curr
 
+    if return_ratio and outer_max > 0:
+        # Recompute regardless of verbose/check cadence.
+        spatial = float(((L_base @ V) * V).sum())
+        coupling_pen = float(((L @ V) * V).sum()) - spatial
+        data = objective(V, L) - spatial - coupling_pen
+        ratios = (spatial / data, coupling_pen / data)
+
     if return_numpy:
-        return (
+        out = (
             [V_i.cpu().numpy() for V_i in V_init],
             [None if p is None else sp.csr_matrix(p.cpu().numpy()) for p in pi],
             csr_to_scipy(L),
         )
-    return V_init, pi, L
+    else:
+        out = (V_init, pi, L)
+
+    if return_ratio:
+        if outer_max <= 0:
+            return (*out, np.nan, np.nan)
+        return (*out, *ratios)
+    return out

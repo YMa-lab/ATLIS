@@ -61,7 +61,7 @@ def analyze_cluster_dynamics(
     n_markers=20,
     random_state=0,
     add_C_labels=True,     
-    C_prefix="C",
+    C_prefix="R",
     rank_chunk=500,        # gene-block size when ranking, to bound memory
     normalize_V = True
 ):
@@ -446,7 +446,7 @@ def summarize_V_by_region(
         )
 
     return pd.concat(frames, ignore_index=True), celltype_name
-
+    
 def add_cluster_annotation_from_V(
     adata,
     V,
@@ -454,58 +454,100 @@ def add_cluster_annotation_from_V(
     cluster_key="cluster",
     key_added="cluster_annotated_celltype",
     confidence_key="cluster_annotated_confidence",
-    normalize=True,
+    second_key="cluster_annotated_second",
+    method="vote",
+    min_confidence=0.0,
+    ambiguous_label="Mixed",
 ):
     """
-    Assign one cell-type label per cluster using average V within each cluster.
+    Assign one cell-type label per cluster from V.
+
+    method="vote"  : each cell votes for its own argmax cell type; the cluster
+                     label is the majority vote and confidence is the vote
+                     fraction. Robust to classes that carry diffuse weight
+                     across many cells.
+    method="mean"  : average the per-cell-normalised V within the cluster and
+                     take the argmax. Confidence is the mean proportion.
+
+    If the winning confidence is below `min_confidence`, the cluster is
+    labelled `ambiguous_label` instead (set min_confidence=0 to disable).
+
+    Adds to adata.obs:
+      key_added        - label per cell (from its cluster)
+      confidence_key   - winning fraction/proportion
+      second_key       - "RunnerUp (23%)" string, useful for mixed clusters
+
+    Returns adata, plus a per-cluster summary DataFrame in
+    adata.uns[key_added + "_summary"].
     """
 
     import numpy as np
     import pandas as pd
 
-    V = np.asarray(V)
+    V = np.asarray(V, dtype=float)
+    celltype_order = list(celltype_order)
 
     if V.shape[0] != adata.n_obs:
         raise ValueError(
             f"V has {V.shape[0]} rows, but adata has {adata.n_obs} observations."
         )
-
     if V.shape[1] != len(celltype_order):
         raise ValueError(
             f"V has {V.shape[1]} columns, but celltype_order has "
             f"{len(celltype_order)} entries."
         )
-
     if cluster_key not in adata.obs:
         raise KeyError(f"'{cluster_key}' not found in adata.obs")
+    if method not in ("vote", "mean"):
+        raise ValueError("method must be 'vote' or 'mean'")
+
+    # per-cell normalisation so that no cell contributes more total mass
+    # than another when averaging
+    Vn = V / (V.sum(axis=1, keepdims=True) + 1e-12)
+    types = np.asarray(celltype_order)
 
     clusters = pd.unique(adata.obs[cluster_key])
-
-    cluster_to_label = {}
-    cluster_to_conf = {}
+    cluster_to_label, cluster_to_conf, cluster_to_second = {}, {}, {}
+    rows = []
 
     for k in clusters:
-        idx = adata.obs[cluster_key].values == k
-        mean_v = V[idx].mean(axis=0)
-        if normalize:
-            mean_v = mean_v / (mean_v.sum() + 1e-12)
-        best = int(np.argmax(mean_v))
-        cluster_to_label[k] = celltype_order[best]
-        cluster_to_conf[k] = float(mean_v[best])
+        idx = (adata.obs[cluster_key].values == k)
+        n = int(idx.sum())
 
-    adata.obs[key_added] = (
-        adata.obs[cluster_key]
-        .map(cluster_to_label)
-        .astype("category")
-    )
+        if method == "vote":
+            winners = types[Vn[idx].argmax(axis=1)]
+            share = (pd.Series(winners)
+                     .value_counts(normalize=True)
+                     .reindex(celltype_order, fill_value=0.0)
+                     .sort_values(ascending=False))
+        else:
+            share = pd.Series(Vn[idx].mean(axis=0),
+                              index=celltype_order).sort_values(ascending=False)
 
-    adata.obs[confidence_key] = (
-        adata.obs[cluster_key]
-        .map(cluster_to_conf)
-        .astype(float)
-    )
+        best, conf = share.index[0], float(share.iloc[0])
+        second, sconf = ((share.index[1], float(share.iloc[1]))
+                         if len(share) > 1 else (None, 0.0))
 
-    return adata
+        cluster_to_label[k] = best if conf >= min_confidence else ambiguous_label
+        cluster_to_conf[k] = conf
+        cluster_to_second[k] = f"{second} ({sconf:.0%})" if second else ""
+
+        rows.append(dict(cluster=k, n_cells=n, label=cluster_to_label[k],
+                         confidence=conf, second=second, second_frac=sconf,
+                         **{f"frac_{t}": float(share.get(t, 0.0))
+                            for t in celltype_order}))
+
+    adata.obs[key_added] = (adata.obs[cluster_key]
+                            .map(cluster_to_label).astype("category"))
+    adata.obs[confidence_key] = adata.obs[cluster_key].map(cluster_to_conf).astype(float)
+    adata.obs[second_key] = adata.obs[cluster_key].map(cluster_to_second).astype(str)
+
+    summary = (pd.DataFrame(rows)
+               .sort_values("confidence", ascending=False)
+               .reset_index(drop=True))
+    adata.uns[key_added + "_summary"] = summary
+
+    return adata#, summary
 
 
 
@@ -848,7 +890,7 @@ def plot_gene_lollipop_by_region(
         if rotate_xticks:
             ax.tick_params(axis="x", rotation=45)
 
-        ax.set_xlabel("Cluster")
+        ax.set_xlabel("Region")
         ax.set_ylabel(
             {"mean_expr": "Mean expression", "frac_expr": "Fraction expressing"}
             .get(value, value)

@@ -690,7 +690,7 @@ def plot_V_dotplot_from_adata(
     ax.set_yticks(range(len(time_order)))
     ax.set_yticklabels(time_order)
 
-    ax.set_xlabel("Cluster", fontsize=fontsize)
+    ax.set_xlabel("Region", fontsize=fontsize)
     ax.set_ylabel(time_name, fontsize=fontsize)
     ax.invert_yaxis()
 
@@ -1423,3 +1423,227 @@ def plot_gene_panels(gene, rows, spot_size=5, cmap="Reds", q=0.99,
     cbar.set_ticks([0, 1]); cbar.set_ticklabels(["Low", "High"])
     fig.suptitle(f"{gene}: spatial expression", fontsize=16, fontweight="bold")
     return fig
+
+
+def plot_pareto_tradeoff(
+    method_names,
+    mass_scores,
+    migration_scores,
+    highlight_method="ATLIS",
+    summary="mean",
+    figsize=(4.0, 3.3),
+    fontsize=11,
+    show_replicates=True,
+    error="sem",
+):
+    reducer = np.mean if summary == "mean" else np.median
+    n = len(method_names)
+
+    clean_names = [m.replace("\n", " ").strip() for m in method_names]
+    highlight_clean = highlight_method.replace("\n", " ").strip()
+
+    # -----------------------------
+    # Summary statistics
+    # -----------------------------
+    mass_mean = np.array([reducer(np.asarray(v, float)) for v in mass_scores])
+    migration_mean = np.array([reducer(np.asarray(v, float)) for v in migration_scores])
+
+    if error == "sem":
+        mass_err = np.array([
+            np.std(np.asarray(v, float), ddof=1) / np.sqrt(len(v))
+            if len(v) > 1 else 0.0
+            for v in mass_scores
+        ])
+        migration_err = np.array([
+            np.std(np.asarray(v, float), ddof=1) / np.sqrt(len(v))
+            if len(v) > 1 else 0.0
+            for v in migration_scores
+        ])
+    else:
+        mass_err = np.array([
+            np.std(np.asarray(v, float), ddof=1)
+            for v in mass_scores
+        ])
+        migration_err = np.array([
+            np.std(np.asarray(v, float), ddof=1)
+            for v in migration_scores
+        ])
+
+    # -----------------------------
+    # Pareto front: higher x, lower y
+    # -----------------------------
+    is_pareto = np.ones(n, dtype=bool)
+
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+
+            dominates = (
+                mass_mean[j] >= mass_mean[i]
+                and migration_mean[j] <= migration_mean[i]
+                and (
+                    mass_mean[j] > mass_mean[i]
+                    or migration_mean[j] < migration_mean[i]
+                )
+            )
+
+            if dominates:
+                is_pareto[i] = False
+                break
+
+    pf_idx = np.where(is_pareto)[0]
+    order = pf_idx[np.argsort(mass_mean[pf_idx])]
+
+    # -----------------------------
+    # Colors
+    # -----------------------------
+    color_dict = {
+        "ATLIS": "#4C78A8",
+        "PASTE": "#9C755F",
+        "DeST-OT": "#17BECF",
+        "Dest-OT": "#17BECF",
+    }
+
+    fallback_colors = plt.cm.tab10(np.linspace(0, 1, n))
+    colors = [
+        color_dict.get(clean_names[i], fallback_colors[i])
+        for i in range(n)
+    ]
+
+    # -----------------------------
+    # Plot
+    # -----------------------------
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for i, name in enumerate(clean_names):
+        color = colors[i]
+        is_highlight = name == highlight_clean
+
+        # Raw replicates
+        if show_replicates:
+            ax.scatter(
+                mass_scores[i],
+                migration_scores[i],
+                color=color,
+                alpha=0.12,
+                s=18,
+                linewidth=0,
+                zorder=1,
+            )
+
+        # Error bars
+        ax.errorbar(
+            mass_mean[i],
+            migration_mean[i],
+            xerr=mass_err[i],
+            yerr=migration_err[i],
+            fmt="none",
+            ecolor=color,
+            alpha=0.8,
+            elinewidth=1.2,
+            capsize=3,
+            zorder=2,
+        )
+
+        # Mean point
+        if is_highlight:
+            ax.scatter(
+                mass_mean[i],
+                migration_mean[i],
+                color=color,
+                s=170,
+                marker="*",
+                edgecolor="black",
+                linewidth=1.2,
+                label=name,
+                zorder=5,
+            )
+        else:
+            ax.scatter(
+                mass_mean[i],
+                migration_mean[i],
+                color=color,
+                s=80,
+                marker="o",
+                edgecolor="black",
+                linewidth=0.7,
+                label=name,
+                zorder=4,
+            )
+
+    # Pareto front
+    if len(order) > 1:
+        ax.plot(
+            mass_mean[order],
+            migration_mean[order],
+            "--",
+            color="black",
+            linewidth=1.2,
+            label="Pareto front",
+            zorder=3,
+        )
+
+    # Pareto points
+    ax.scatter(
+        mass_mean[is_pareto],
+        migration_mean[is_pareto],
+        s=190,
+        facecolors="none",
+        edgecolors="black",
+        linewidths=1.1,
+        zorder=3,
+    )
+
+    # -----------------------------
+    # Axis limits from mean ± error, not raw outliers
+    # -----------------------------
+    x_low = np.min(mass_mean - mass_err)
+    x_high = np.max(mass_mean + mass_err)
+    y_low = np.min(migration_mean - migration_err)
+    y_high = np.max(migration_mean + migration_err)
+
+    x_range = x_high - x_low
+    y_range = y_high - y_low
+
+    ax.set_xlim(
+        max(0, x_low - 0.25 * x_range),
+        x_high + 0.25 * x_range
+    )
+
+    # y-axis inverted: lower migration is visually higher
+    ax.set_ylim(
+        y_high + 0.30 * y_range,
+        max(0, y_low - 0.30 * y_range)
+    )
+
+    # -----------------------------
+    # Labels and styling
+    # -----------------------------
+    ax.set_xlabel("Same-type transported mass (↑ better)", fontsize=fontsize)
+    ax.set_ylabel("Migration speed (↓ better)", fontsize=fontsize)
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    ax.tick_params(labelsize=fontsize - 1)
+
+    # Put legend outside; this solves label collision cleanly
+    ax.legend(
+        frameon=False,
+        fontsize=fontsize - 1,
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        borderaxespad=0.0,
+    )
+
+    fig.tight_layout()
+
+    return fig, ax, {
+        "mass_mean": mass_mean,
+        "migration_mean": migration_mean,
+        "mass_err": mass_err,
+        "migration_err": migration_err,
+        "is_pareto": is_pareto,
+        "pareto_methods": [method_names[i] for i in pf_idx],
+    }
